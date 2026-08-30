@@ -499,23 +499,29 @@ const CONFLICT_PROMPT_ZH = [
   '',
   '## 关键信息',
   '- 同步仓库：{{repoUrl}}（GitCode，API base = https://api.gitcode.com）',
-  '- 本地工作树（影子仓库）：{{shadowDir}}（已 checkout 到冲突分支 {{branch}}）',
+  '- 本地工作树（影子仓库）：{{shadowDir}}（需 checkout 到冲突分支 {{branch}}）',
   '- PR 编号：#{{prNumber}}',
-  '- PAT 位置：~/.dsh/settings.yaml 中 dsh-sync 段的 token 字段（由同步设置面板保存）。',
+  '- 访问令牌：已注入环境变量 $DSH_SYNC_TOKEN（用 `printenv DSH_SYNC_TOKEN` 读取）。',
+  '',
+  '## 工具限制（硬性）',
+  '- 只允许使用 bash（git/curl 命令）和 HTTP 请求工具。',
+  '- **严禁**使用任何 return / deliver / 投递 / IM 文件类工具（如 dsh_im_return_file）。不要把任何文件“投递”或“返回”出去。',
+  '- **不要读取 ~/.dsh/settings.yaml**——token 已在 $DSH_SYNC_TOKEN 里，别碰配置文件。',
+  '- token 是敏感凭据，任何输出、日志、结果里都不要回显其明文。',
   '',
   '## 执行步骤',
-  '1. 读取 PAT：读取 ~/.dsh/settings.yaml，定位 dsh-sync 段下的 token 字段。token 是敏感凭据，读取后不要把明文打印到输出、日志或结果里。',
-  '2. 在影子仓库 {{shadowDir}} 内：`git fetch origin main`（若 origin 未配，用 `git fetch https://gitcode.com/<owner>/<repo>.git main`，token 用 oauth2:<token>@ 形式嵌进 URL，不要落 .git/config）。',
-  '3. 查看冲突文件：`git diff --name-only --diff-filter=U` 和 `git status`，对每个冲突文件分析 origin/main 与本机分支两边的版本，判断该如何取舍或合并（保留两边的有效改动；若无法判断，保留本机版本并在 PR 描述里说明）。',
-  '4. 编辑解决冲突后：`git add -A`、`git -c user.name=dsh-sync -c user.email=dsh-sync@local commit --no-edit`，再 push（同样用嵌 token 的 URL：`git push https://oauth2:<token>@gitcode.com/<owner>/<repo>.git HEAD:<branch>`，<branch> = {{branch}}）。',
-  '5. 用第 1 步的 token 作 bearer 认证调 GitCode API：`GET https://api.gitcode.com/api/v5/repos/<owner>/<repo>/pulls/{{prNumber}}`，确认 mergeable 为 true。',
-  '6. 合并：`PUT https://api.gitcode.com/api/v5/repos/<owner>/<repo>/pulls/{{prNumber}}/merge`，body 为 {"merge_method":"squash"}。',
-  '7. 完成后输出 PR 的网页链接（响应里的 web_url 字段）。',
+  '1. 取 token：`printenv DSH_SYNC_TOKEN`（不要读 settings.yaml）。',
+  '2. 在影子仓库内：`cd {{shadowDir}} && git fetch https://oauth2:$(printenv DSH_SYNC_TOKEN)@gitcode.com/<owner>/<repo>.git main`（token 嵌 URL、不落 .git/config），然后 `git checkout {{branch}}`，再 `git merge FETCH_HEAD` 触发冲突。',
+  '3. 查看冲突文件：`git diff --name-only --diff-filter=U` 和 `git status`。对每个冲突文件分析两边版本决定取舍或合并（保留两边有效改动；README 等无语义文件取任一即可）。',
+  '4. 解决后：`git add -A && git -c user.name=dsh-sync -c user.email=dsh-sync@local commit --no-edit`，再 `git push https://oauth2:$(printenv DSH_SYNC_TOKEN)@gitcode.com/<owner>/<repo>.git HEAD:{{branch}}`。',
+  '5. 查 PR 可合并：`curl -s -H "PRIVATE-TOKEN: $(printenv DSH_SYNC_TOKEN)" https://api.gitcode.com/api/v5/repos/<owner>/<repo>/pulls/{{prNumber}}`，确认 mergeable 为 true。',
+  '6. 合并：`curl -s -X PUT -H "PRIVATE-TOKEN: $(printenv DSH_SYNC_TOKEN)" -H "Content-Type: application/json" -d \'{"merge_method":"squash"}\' https://api.gitcode.com/api/v5/repos/<owner>/<repo>/pulls/{{prNumber}}/merge`。',
+  '7. 完成后输出 PR 网页链接。',
   '',
   '## 注意',
-  '- token 是敏感凭据，任何输出里都不要回显其明文。',
-  '- 若任一步骤失败，先检查错误信息，不要盲目重试；若 token 失效，提示用户到同步设置面板重新填写。',
-  '- 全程与最终汇报都使用中文。',
+  '- 认证头必须用 PRIVATE-TOKEN（不要用 Authorization: Bearer，GitCode 子资源端点对 Bearer 有 bug 会 404）。',
+  '- 不读 settings.yaml；不回显 token；不用投递类工具。',
+  '- 若失败先看错误信息，不盲目重试。全程与最终汇报都使用中文。',
 ].join('\n')
 
 function substituteParams(template, params) {
@@ -526,14 +532,19 @@ function substituteParams(template, params) {
   return out
 }
 
-async function runConflictInProcess(services, { prompt, dir, job, logger }) {
+async function runConflictInProcess(services, { prompt, dir, job, logger, token }) {
+  // token 注入进程环境变量（agent 的 bash 工具继承 process.env）——不让 AI 读
+  // settings.yaml，从根上杜绝 AI 误用投递工具把整个 settings.yaml 发出去。
+  // finally 恢复，避免 token 长期滞留进程环境。
+  const prevEnv = process.env.DSH_SYNC_TOKEN
+  process.env.DSH_SYNC_TOKEN = token || ''
+  try {
   const selection = services.agentDefaultModel.currentSelection()
   const sessionId = 'session-' + randomUUID()
   job.sessionId = sessionId
   const { agent } = await services.agents.create({
     sessionId,
-    // 标准预设：不带显式选择会继承用户默认（如 Solo Thinking 只有
-    // thinking/notify 工具），读文件/调 API/跑 git 都做不了
+    // 标准模式（用户定）：工具集不额外精简，靠 prompt 禁投递工具 + token 注入 env 兜底
     meta: { cwd: dir, agentPreset: 'standard' },
     agentOptions: { provider: selection.provider, model: selection.model },
   })
@@ -564,20 +575,24 @@ async function runConflictInProcess(services, { prompt, dir, job, logger }) {
   job.status = 'done'
   job.code = 0
   return job
+  } finally {
+    if (prevEnv === undefined) delete process.env.DSH_SYNC_TOKEN
+    else process.env.DSH_SYNC_TOKEN = prevEnv
+  }
 }
 
-function createConflictRunJob({ binary, prompt, dir, jobs, logger, services }) {
+function createConflictRunJob({ binary, prompt, dir, jobs, logger, services, token }) {
   const id = 'cf' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
   const job = { id, status: 'running', startedAt: new Date().toISOString(), dir, output: '', code: null }
   jobs.set(id, job)
   if (services && services.agents && services.agentDefaultModel) {
-    runConflictInProcess(services, { prompt, dir, job, logger })
+    runConflictInProcess(services, { prompt, dir, job, logger, token })
       .catch(e => { job.status = 'error'; job.output = (job.output + '\n' + String(e && e.message)).slice(-CONFLICT_RUN_OUTPUT_CAP) })
     return job
   }
   // fallback spawn (headless) — never carries token safety of the in-process path
   let child
-  try { child = require('node:child_process').spawn(binary, ['--profile', 'headless', prompt], { cwd: dir }) }
+  try { child = require('node:child_process').spawn(binary, ['--profile', 'headless', prompt], { cwd: dir, env: { ...process.env, DSH_SYNC_TOKEN: token || '' } }) }
   catch (e) { job.status = 'error'; job.output = String(e && e.message); return job }
   const append = (chunk) => { job.output = (job.output + String(chunk)).slice(-CONFLICT_RUN_OUTPUT_CAP) }
   child.stdout && child.stdout.on('data', append)
@@ -790,7 +805,7 @@ module.exports = {
               repoUrl: eff.repoUrl, shadowDir: repoDir, branch, prNumber,
             })
             const binary = process.env.DSHSYNC_DSH_BIN || 'dsh'
-            const job = createConflictRunJob({ binary, prompt, dir: repoDir, jobs: conflictRunJobs, logger: ctx.logger, services: shareServices })
+            const job = createConflictRunJob({ binary, prompt, dir: repoDir, jobs: conflictRunJobs, logger: ctx.logger, services: shareServices, token: eff.token })
             sendJson(res, 202, { jobId: job.id, status: job.status })
             return
           }
