@@ -581,16 +581,13 @@ async function runConflictInProcess(services, { prompt, dir, job, logger, token 
   }
 }
 
-function createConflictRunJob({ binary, prompt, dir, jobs, logger, services, token }) {
+function createConflictRunJob({ binary, prompt, dir, jobs, logger, token }) {
   const id = 'cf' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
   const job = { id, status: 'running', startedAt: new Date().toISOString(), dir, output: '', code: null }
   jobs.set(id, job)
-  if (services && services.agents && services.agentDefaultModel) {
-    runConflictInProcess(services, { prompt, dir, job, logger, token })
-      .catch(e => { job.status = 'error'; job.output = (job.output + '\n' + String(e && e.message)).slice(-CONFLICT_RUN_OUTPUT_CAP) })
-    return job
-  }
-  // fallback spawn (headless) — never carries token safety of the in-process path
+  // standard preset 的 in-process agent 实测只有 thinking + 插件全局工具（如 dsh_im_return_file），
+  // 无 bash/git/curl——跑不了冲突解决。headless profile 装 dsh-base（提供 bash-sandbox/tool-bash），
+  // agent 有 bash，故 conflict 走 headless spawn。token 经 env 注入（不读 settings.yaml）。
   let child
   try { child = require('node:child_process').spawn(binary, ['--profile', 'headless', prompt], { cwd: dir, env: { ...process.env, DSH_SYNC_TOKEN: token || '' } }) }
   catch (e) { job.status = 'error'; job.output = String(e && e.message); return job }
@@ -805,7 +802,7 @@ module.exports = {
               repoUrl: eff.repoUrl, shadowDir: repoDir, branch, prNumber,
             })
             const binary = process.env.DSHSYNC_DSH_BIN || 'dsh'
-            const job = createConflictRunJob({ binary, prompt, dir: repoDir, jobs: conflictRunJobs, logger: ctx.logger, services: shareServices, token: eff.token })
+            const job = createConflictRunJob({ binary, prompt, dir: repoDir, jobs: conflictRunJobs, logger: ctx.logger, token: eff.token })
             sendJson(res, 202, { jobId: job.id, status: job.status })
             return
           }
