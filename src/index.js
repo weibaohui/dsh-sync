@@ -501,21 +501,21 @@ const CONFLICT_PROMPT_ZH = [
   '- 同步仓库：{{repoUrl}}（GitCode，API base = https://api.gitcode.com）',
   '- 本地工作树（影子仓库）：{{shadowDir}}（需 checkout 到冲突分支 {{branch}}）',
   '- PR 编号：#{{prNumber}}',
-  '- 访问令牌：已注入环境变量 $DSH_SYNC_TOKEN（用 `printenv DSH_SYNC_TOKEN` 读取）。',
+  '- 访问令牌：{{token}}（下方步骤直接用此字符串，不要 printenv、不要回显明文）。',
   '',
   '## 工具限制（硬性）',
   '- 只允许使用 bash（git/curl 命令）和 HTTP 请求工具。',
   '- **严禁**使用任何 return / deliver / 投递 / IM 文件类工具（如 dsh_im_return_file）。不要把任何文件“投递”或“返回”出去。',
-  '- **不要读取 ~/.dsh/settings.yaml**——token 已在 $DSH_SYNC_TOKEN 里，别碰配置文件。',
+  '- **不要读取 ~/.dsh/settings.yaml**——token 已在上方给你，别碰配置文件。',
   '- token 是敏感凭据，任何输出、日志、结果里都不要回显其明文。',
   '',
   '## 执行步骤',
-  '1. 取 token：`printenv DSH_SYNC_TOKEN`（不要读 settings.yaml）。',
-  '2. 在影子仓库内：`cd {{shadowDir}} && git fetch https://oauth2:$(printenv DSH_SYNC_TOKEN)@gitcode.com/<owner>/<repo>.git main`（token 嵌 URL、不落 .git/config），然后 `git checkout {{branch}}`，再 `git merge FETCH_HEAD` 触发冲突。',
+  '1. token 已在上方「访问令牌」行给出，后续步骤直接用该字符串（不要 printenv）。',
+  '2. 在影子仓库内：`cd {{shadowDir}} && git fetch https://oauth2:{{token}}@gitcode.com/<owner>/<repo>.git main`（token 嵌 URL、不落 .git/config），然后 `git checkout {{branch}}`，再 `git merge FETCH_HEAD` 触发冲突。',
   '3. 查看冲突文件：`git diff --name-only --diff-filter=U` 和 `git status`。对每个冲突文件分析两边版本决定取舍或合并（保留两边有效改动；README 等无语义文件取任一即可）。',
-  '4. 解决后：`git add -A && git -c user.name=dsh-sync -c user.email=dsh-sync@local commit --no-edit`，再 `git push https://oauth2:$(printenv DSH_SYNC_TOKEN)@gitcode.com/<owner>/<repo>.git HEAD:{{branch}}`。',
-  '5. 查 PR 可合并：`curl -s -H "PRIVATE-TOKEN: $(printenv DSH_SYNC_TOKEN)" https://api.gitcode.com/api/v5/repos/<owner>/<repo>/pulls/{{prNumber}}`，确认 mergeable 为 true。',
-  '6. 合并：`curl -s -X PUT -H "PRIVATE-TOKEN: $(printenv DSH_SYNC_TOKEN)" -H "Content-Type: application/json" -d \'{"merge_method":"squash"}\' https://api.gitcode.com/api/v5/repos/<owner>/<repo>/pulls/{{prNumber}}/merge`。',
+  '4. 解决后：`git add -A && git -c user.name=dsh-sync -c user.email=dsh-sync@local commit --no-edit`，再 `git push https://oauth2:{{token}}@gitcode.com/<owner>/<repo>.git HEAD:{{branch}}`。',
+  '5. 查 PR 可合并：`curl -s -H "PRIVATE-TOKEN: {{token}}" https://api.gitcode.com/api/v5/repos/<owner>/<repo>/pulls/{{prNumber}}`，确认 mergeable 为 true。',
+  '6. 合并：`curl -s -X PUT -H "PRIVATE-TOKEN: {{token}}" -H "Content-Type: application/json" -d \'{"merge_method":"squash"}\' https://api.gitcode.com/api/v5/repos/<owner>/<repo>/pulls/{{prNumber}}/merge`。',
   '7. 完成后输出 PR 网页链接。',
   '',
   '## 注意',
@@ -552,9 +552,8 @@ async function apiproxy(method, payload) {
 }
 
 async function runConflictViaApiproxy({ prompt, dir, job, sessions, logger, token }) {
-  // token 注入 env（agent 的 bash 工具继承 process.env），AI 用 printenv 取，不读 settings.yaml
-  const prev = process.env.DSH_SYNC_TOKEN
-  process.env.DSH_SYNC_TOKEN = token || ''
+  // token 经 prompt 内联（{{token}}）--apiproxy 主对话级 session 的 bash 是 host-plane
+  // executor，不继承 dsh web 进程的 process.env，故不能像 headless spawn 那样 env 注入
   try {
     // 1. 创建主对话级 session（有 bash）+ 发 prompt
     const created = await apiproxy('session.create', { cwd: dir })
@@ -577,8 +576,22 @@ async function runConflictViaApiproxy({ prompt, dir, job, sessions, logger, toke
         const d = ev.data || ev
         const ty = ev.type
         if (ty === 'assistant/chunk' && d.chunk && d.chunk.type === 'text' && d.chunk.text) liveLine(d.chunk.text)
-        else if (ty === 'tool/call') liveLine('\n[tool] ' + (d.name || '?') + ' ')
-        else if (ty === 'tool/result') { const rc = d.content || d.output || d.message || ''; liveLine('\n→ ' + String(rc).slice(0, 240) + '\n') }
+        else if (ty === 'tool/call') {
+          const args = d.arguments || d.input || {}
+          const cmd = (args && typeof args === 'object' ? (args.command || JSON.stringify(args)) : String(args))
+          liveLine('\n[tool] ' + (d.name || '?') + ' ' + String(cmd).slice(0, 200) + '\n')
+        }
+        else if (ty === 'tool/result') {
+          let rc = ''
+          const msg = d.message || d
+          const outer = (msg && Array.isArray(msg.content)) ? msg.content : (Array.isArray(d.content) ? d.content : [])
+          for (const it of outer) {
+            const inner = it && it.content
+            if (Array.isArray(inner)) { for (const x of inner) { if (x && x.text) rc += x.text } }
+            else if (typeof inner === 'string') rc += inner
+          }
+          if (rc) liveLine('-> ' + rc.slice(0, 240) + '\n')
+        }
         else if (ty === 'turn/end') finished = true
       }
     }
@@ -594,10 +607,7 @@ async function runConflictViaApiproxy({ prompt, dir, job, sessions, logger, toke
     job.status = finished ? 'done' : 'error'
     job.code = finished ? 0 : 1
     if (!finished) job.output += '\n[超时未完成]'
-  } finally {
-    if (prev === undefined) delete process.env.DSH_SYNC_TOKEN
-    else process.env.DSH_SYNC_TOKEN = prev
-  }
+  } finally {}
   return job
 }
 
@@ -818,7 +828,7 @@ module.exports = {
             const prNumber = body.prNumber || state.lastPrNumber
             if (!branch || !prNumber) { sendJson(res, 400, { error: '没有待解决的冲突 PR' }); return }
             const prompt = substituteParams(CONFLICT_PROMPT_ZH, {
-              repoUrl: eff.repoUrl, shadowDir: repoDir, branch, prNumber,
+              repoUrl: eff.repoUrl, shadowDir: repoDir, branch, prNumber, token: eff.token,
             })
             const job = createConflictRunJob({ prompt, dir: repoDir, jobs: conflictRunJobs, logger: ctx.logger, sessions: sessionsSvc, token: eff.token })
             sendJson(res, 202, { jobId: job.id, status: job.status })
