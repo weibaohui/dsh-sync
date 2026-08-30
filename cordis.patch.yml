@@ -1,0 +1,12 @@
+# dsh-plugin-dsh-sync bundle patch: contributes the plugin row into the host
+# composition when this package is installed via `dsh plugin add`.
+#
+# The plugin is HOST-PLANE: it owns a private git working tree under
+# $DSH_HOME/dsh-sync and reconciles it with a private GitCode repository,
+# serving its HTTP API over a webServer route. Its client half registers a
+# full-page sync status surface plus a settings page. It must therefore land
+# in the host composition (this insert), never inside an agent preset.
+
+- insert:
+    - id: dsh-sync
+      name: 'dsh-plugin-dsh-sync'
