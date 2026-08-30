@@ -532,23 +532,88 @@ function substituteParams(template, params) {
   return out
 }
 
-function createConflictRunJob({ binary, prompt, dir, jobs, logger, token }) {
+// apiproxy client: dsh web 的 /api HTTP RPC（web 客户端同款），创建主对话级 session。
+// 关键区别：apiproxy session.create 建的是 web 主对话级 agent（agentPreset=standard
+// + dsh-base 全工具，含 bash——实测 tool/call=bash + pwd 跑通）；而 agents.create 子 agent
+// 是精简 scope（只有 thinking + 插件全局工具，无 bash）。故 conflict 走 apiproxy 不走
+// agents.create。base URL 可由 DSH_WEB_URL 覆盖，默认本地 3080。
+const APIPROXY_BASE = process.env.DSH_WEB_URL || 'http://127.0.0.1:3080'
+async function apiproxy(method, payload) {
+  const rpcId = 'dshsync-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
+  const r = await fetch(APIPROXY_BASE + '/api/' + method, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'client-request', rpcId, method, payload }),
+  })
+  const j = await r.json().catch(() => ({}))
+  const res = j.result
+  if (!res || !res.ok) throw new Error('apiproxy ' + method + ' 失败: ' + JSON.stringify(j).slice(0, 200))
+  return res.value
+}
+
+async function runConflictViaApiproxy({ prompt, dir, job, sessions, logger, token }) {
+  // token 注入 env（agent 的 bash 工具继承 process.env），AI 用 printenv 取，不读 settings.yaml
+  const prev = process.env.DSH_SYNC_TOKEN
+  process.env.DSH_SYNC_TOKEN = token || ''
+  try {
+    // 1. 创建主对话级 session（有 bash）+ 发 prompt
+    const created = await apiproxy('session.create', { cwd: dir })
+    const sessionId = created && created.sessionId
+    if (!sessionId) throw new Error('session.create 未返回 sessionId')
+    job.sessionId = sessionId
+    await apiproxy('session.prompt', { sessionId, mode: 'queue', content: [{ type: 'text', text: prompt }] })
+    // 2. events 泵：ctx.sessions.get(sessionId) 同进程读活会话 events，300ms 取新
+    let session
+    try { session = sessions.get(sessionId) } catch (e) { throw new Error('ctx.sessions.get(' + sessionId + ') 失败: ' + (e && e.message)) }
+    const seen = new Set()
+    const liveLine = (text) => { job.output = (job.output + text).slice(-CONFLICT_RUN_OUTPUT_CAP) }
+    let finished = false
+    const pump = () => {
+      const evs = (session && Array.isArray(session.events)) ? session.events : []
+      for (const ev of evs) {
+        const seq = ev.seq
+        if (seq != null && seen.has(seq)) continue
+        if (seq != null) seen.add(seq)
+        const d = ev.data || ev
+        const ty = ev.type
+        if (ty === 'assistant/chunk' && d.chunk && d.chunk.type === 'text' && d.chunk.text) liveLine(d.chunk.text)
+        else if (ty === 'tool/call') liveLine('\n[tool] ' + (d.name || '?') + ' ')
+        else if (ty === 'tool/result') { const rc = d.content || d.output || d.message || ''; liveLine('\n→ ' + String(rc).slice(0, 240) + '\n') }
+        else if (ty === 'turn/end') finished = true
+      }
+    }
+    const timer = setInterval(pump, 300)
+    if (typeof timer.unref === 'function') timer.unref()
+    // 3. 等跑完（turn/end）或超时
+    const deadline = Date.now() + CONFLICT_RUN_TIMEOUT_MS
+    await new Promise((resolve) => {
+      const wait = setInterval(() => { if (finished || Date.now() > deadline) { clearInterval(wait); resolve() } }, 500)
+      if (typeof wait.unref === 'function') wait.unref()
+    })
+    clearInterval(timer); pump()
+    job.status = finished ? 'done' : 'error'
+    job.code = finished ? 0 : 1
+    if (!finished) job.output += '\n[超时未完成]'
+  } finally {
+    if (prev === undefined) delete process.env.DSH_SYNC_TOKEN
+    else process.env.DSH_SYNC_TOKEN = prev
+  }
+  return job
+}
+
+function createConflictRunJob({ prompt, dir, jobs, logger, sessions, token }) {
   const id = 'cf' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
   const job = { id, status: 'running', startedAt: new Date().toISOString(), dir, output: '', code: null }
   jobs.set(id, job)
-  // standard preset 的 in-process agent 实测只有 thinking + 插件全局工具（如 dsh_im_return_file），
-  // 无 bash/git/curl——跑不了冲突解决。headless profile 装 dsh-base（提供 bash-sandbox/tool-bash），
-  // agent 有 bash，故 conflict 走 headless spawn。token 经 env 注入（不读 settings.yaml）。
-  let child
-  try { child = require('node:child_process').spawn(binary, ['--profile', 'headless', prompt], { cwd: dir, env: { ...process.env, DSH_SYNC_TOKEN: token || '' } }) }
-  catch (e) { job.status = 'error'; job.output = String(e && e.message); return job }
-  const append = (chunk) => { job.output = (job.output + String(chunk)).slice(-CONFLICT_RUN_OUTPUT_CAP) }
-  child.stdout && child.stdout.on('data', append)
-  child.stderr && child.stderr.on('data', append)
-  const timer = setTimeout(() => { try { child.kill('SIGKILL') } catch {}; job.status = 'error'; job.output += '\n[killed: timeout]' }, CONFLICT_RUN_TIMEOUT_MS)
-  if (typeof timer.unref === 'function') timer.unref()
-  child.on('error', (e) => { clearTimeout(timer); job.status = 'error'; append('\n' + String(e && e.message)) })
-  child.on('close', (code) => { clearTimeout(timer); if (job.status === 'running') { job.status = code === 0 ? 'done' : 'error'; job.code = code } })
+  // 走 apiproxy 创建主对话级 session（standard preset + dsh-base 全工具，含 bash），
+  // 不是 agents.create 子 agent（精简无 bash）。token 注入 env，events 经 ctx.sessions.get 流式读。
+  if (!sessions || typeof sessions.get !== 'function') {
+    job.status = 'error'
+    job.output = 'sessions 服务不可用（动态 ctx.inject 失败）'
+    return job
+  }
+  runConflictViaApiproxy({ prompt, dir, job, sessions, logger, token })
+    .catch(e => { job.status = 'error'; job.output = (job.output + '\n' + String(e && e.message)).slice(-CONFLICT_RUN_OUTPUT_CAP) })
   return job
 }
 
@@ -645,8 +710,17 @@ module.exports = {
       return syncRun
     }
 
-    // ── Conflict-resolution jobs (action button → headless spawn) ──
+    // ── Conflict-resolution jobs (action button → apiproxy 主对话级 session) ──
     const conflictRunJobs = new Map()
+    // 动态注入 sessions 服务：conflict 走 apiproxy 创建主对话级 session 后，
+    // 用 ctx.sessions.get(sessionId).events 流式读 agent 输出（像 agents.create 事件泵，
+    // 但这个 agent 有 bash）
+    let sessionsSvc = null
+    try {
+      if (ctx.inject && typeof ctx.inject === 'function') {
+        ctx.inject(['sessions'], (svcs) => { sessionsSvc = svcs && svcs.sessions })
+      }
+    } catch {}
 
     // ── Startup + periodic auto-sync ──
     ctx.effect(() => {
@@ -746,8 +820,7 @@ module.exports = {
             const prompt = substituteParams(CONFLICT_PROMPT_ZH, {
               repoUrl: eff.repoUrl, shadowDir: repoDir, branch, prNumber,
             })
-            const binary = process.env.DSHSYNC_DSH_BIN || 'dsh'
-            const job = createConflictRunJob({ binary, prompt, dir: repoDir, jobs: conflictRunJobs, logger: ctx.logger, token: eff.token })
+            const job = createConflictRunJob({ prompt, dir: repoDir, jobs: conflictRunJobs, logger: ctx.logger, sessions: sessionsSvc, token: eff.token })
             sendJson(res, 202, { jobId: job.id, status: job.status })
             return
           }
