@@ -188,7 +188,10 @@ function parseRepoUrl(url) {
 
 async function gitcodeRequest(token, method, path, body, { apiBase = GITCODE_API_BASE } = {}) {
   const url = apiBase + path
-  const init = { method, headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' } }
+  // 认证必须用 PRIVATE-TOKEN（实测 GitCode 子资源端点 branches/pulls 对
+  // Authorization: Bearer 有 bug——带 Bearer 查 project 一律 404 not found，
+  // 匿名 / PRIVATE-TOKEN / access_token query 均正常）
+  const init = { method, headers: { 'PRIVATE-TOKEN': token, 'Content-Type': 'application/json' } }
   if (body !== undefined) init.body = JSON.stringify(body)
   const r = await fetch(url, init)
   const text = await r.text()
@@ -349,6 +352,9 @@ async function ensureShadowRepo(binary, eff, repoDir) {
     // which case init locally and let the first push seed the remote.
     try {
       await gitExec(binary, ['clone', '-b', eff.branch, '--depth', '1', remote, repoDir])
+      // clone 会把带 token 的 URL 写进 .git/config——立刻换回干净地址，
+      // 后续 fetch/push 一律显式传 authedUrl，凭证不落盘
+      await gitExec(binary, ['remote', 'set-url', 'origin', eff.repoUrl], repoDir).catch(() => {})
     } catch {
       await fsP.mkdir(repoDir, { recursive: true })
       await gitExec(binary, ['init', '-b', eff.branch], repoDir)
@@ -403,11 +409,8 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots 
     state.lastPushedBranch = branch
     return { pushed: true, prSkipped: true, branch }
   }
-  const head = `${instanceId.split('-')[0]}:${branch}` // GitCode head = <user>:<branch>; owner unknown pre-check → best-effort
-  // We need the token owner's login for head. Query /user once.
-  const userRes = await gitcodeRequest(eff.token, 'GET', '/user')
-  const login = userRes.ok && userRes.json && userRes.json.login
-  const prBody = { head: login ? `${login}:${branch}` : branch, base: eff.branch, title: `dsh-sync ${instanceId}`, body: `Auto sync from ${instanceId}` }
+  // 同仓库 PR 的 head 就是分支名（`user:branch` 是 fork PR 语法，GitCode 会 400）
+  const prBody = { head: branch, base: eff.branch, title: `dsh-sync ${instanceId}`, body: `Auto sync from ${instanceId}` }
   const prRes = await createPullRequest(eff.token, parsed.owner, parsed.repo, prBody)
   if (!prRes.ok) {
     // 409 = branch already has an open PR (idempotent retry); try to find it
