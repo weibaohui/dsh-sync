@@ -532,55 +532,6 @@ function substituteParams(template, params) {
   return out
 }
 
-async function runConflictInProcess(services, { prompt, dir, job, logger, token }) {
-  // token 注入进程环境变量（agent 的 bash 工具继承 process.env）——不让 AI 读
-  // settings.yaml，从根上杜绝 AI 误用投递工具把整个 settings.yaml 发出去。
-  // finally 恢复，避免 token 长期滞留进程环境。
-  const prevEnv = process.env.DSH_SYNC_TOKEN
-  process.env.DSH_SYNC_TOKEN = token || ''
-  try {
-  const selection = services.agentDefaultModel.currentSelection()
-  const sessionId = 'session-' + randomUUID()
-  job.sessionId = sessionId
-  const { agent } = await services.agents.create({
-    sessionId,
-    // 标准模式（用户定）：工具集不额外精简，靠 prompt 禁投递工具 + token 注入 env 兜底
-    meta: { cwd: dir, agentPreset: 'standard' },
-    agentOptions: { provider: selection.provider, model: selection.model },
-  })
-  await agent.whenIdle()
-  const firstSeq = agent.session.seq
-  const seen = new Set()
-  const liveLine = (text) => { job.output = (job.output + text).slice(-CONFLICT_RUN_OUTPUT_CAP) }
-  const pump = () => {
-    for (const ev of agent.session.events) {
-      if (ev.seq < firstSeq || seen.has(ev.seq)) continue
-      seen.add(ev.seq)
-      const d = ev.data || {}
-      if (ev.type === 'assistant/chunk' && d.chunk && d.chunk.type === 'text' && d.chunk.text) liveLine(d.chunk.text)
-      else if (ev.type === 'tool/call') liveLine('\n[tool] ' + d.name + ' ')
-      else if (ev.type === 'assistant/message') liveLine('\n')
-    }
-  }
-  const timer = setInterval(pump, 300)
-  if (typeof timer.unref === 'function') timer.unref()
-  try {
-    agent.followup({ content: [{ type: 'text', text: prompt }], source: { kind: 'user' } })
-    await agent.whenIdle()
-  } finally {
-    clearInterval(timer)
-    pump()
-  }
-  try { await services.sessions.flush(agent.session) } catch {}
-  job.status = 'done'
-  job.code = 0
-  return job
-  } finally {
-    if (prevEnv === undefined) delete process.env.DSH_SYNC_TOKEN
-    else process.env.DSH_SYNC_TOKEN = prevEnv
-  }
-}
-
 function createConflictRunJob({ binary, prompt, dir, jobs, logger, token }) {
   const id = 'cf' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
   const job = { id, status: 'running', startedAt: new Date().toISOString(), dir, output: '', code: null }
@@ -694,14 +645,8 @@ module.exports = {
       return syncRun
     }
 
-    // ── Conflict-resolution jobs (action button → in-process agent) ──
+    // ── Conflict-resolution jobs (action button → headless spawn) ──
     const conflictRunJobs = new Map()
-    let shareServices = null
-    try {
-      if (ctx.inject && typeof ctx.inject === 'function') {
-        ctx.inject(['agents', 'agentDefaultModel', 'sessions'], (svcs) => { shareServices = svcs })
-      }
-    } catch {}
 
     // ── Startup + periodic auto-sync ──
     ctx.effect(() => {
