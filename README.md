@@ -32,13 +32,3 @@ dsh plugin --profile web add @weibaohui/dsh-sync -w
 3. 按需开关四类同步内容
 4. 之后每次修改，通过同步操作把本机变更推成 PR；多机之间即可保持一致
 5. 出现冲突时，会话界面会出现「AI 解决冲突」按钮，点一下即可
-
-## 发版（维护者）
-
-```bash
-npm version patch            # bump + commit + tag
-git push --follow-tags
-gh release create vX.Y.Z --generate-notes   # 创建 Release 触发自动发布到 npm
-```
-
-发布由 GitHub Actions 完成（Release published 触发；打 tag 不发布），走 npm Trusted Publishing 免 token。
