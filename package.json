@@ -1,6 +1,6 @@
 {
   "name": "@weibaohui/dsh-sync",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "DeepSeek Harness plugin: a small git-based sync system for multiple dsh replicas. Mirrors skills / sessions / settings / plugins into a private GitCode repository and reconciles replicas through a branch → PR → merge flow, so conflicts surface as pull requests instead of silent overwrites.",
   "license": "MIT",
   "keywords": [
