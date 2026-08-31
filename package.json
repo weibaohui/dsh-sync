@@ -1,6 +1,6 @@
 {
   "name": "@weibaohui/dsh-sync",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "dsh 插件 · 多机同步：让多台机器上的 dsh 通过一个私有 GitCode 仓库保持一致——技能、会话、设置、插件清单四类内容各有独立开关；变更走分支 → PR → 合并，冲突显化为待合并 PR，支持 AI 一键解决冲突；强制私有仓库，pull 不覆盖本地改动。",
   "license": "MIT",
   "keywords": [
