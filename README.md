@@ -2,6 +2,25 @@
 
 一个小型 git 同步系统，让多个 dsh 副本通过一个**私有 GitCode 仓库**同步 skills / sessions / settings / plugins。每个实例只能以**分支 → PR → 合并**的形式提交变更，冲突因此显化为一个待合并的 PR，而不是静默覆盖。
 
+
+## 安装
+
+```bash
+dsh plugin --profile web add @weibaohui/dsh-sync -w
+```
+
+装完重启 `dsh web` 即生效。
+
+## 发版（维护者）
+
+```bash
+npm version patch            # bump + commit + tag
+git push --follow-tags
+gh release create vX.Y.Z --generate-notes   # 创建 Release 触发自动发布到 npm
+```
+
+发布由 GitHub Actions 完成（Release published 触发；打 tag 不发布），走 npm Trusted Publishing 免 token。
+
 ## 设计要点
 
 - **影子工作树**：`$DSH_HOME/dsh-sync/repo` 镜像选定的 live 根目录。不在 `~/.dsh` 直接开 git（里面混着凭证、profiles 的 node_modules）。push = fetch `origin/main` → shadow reset 到基线 → 覆盖 live 快照 → 建分支 → commit → push → 建 PR。
