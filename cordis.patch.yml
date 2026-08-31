@@ -9,4 +9,4 @@
 
 - insert:
     - id: dsh-sync
-      name: 'dsh-plugin-dsh-sync'
+      name: '@weibaohui/dsh-sync'
