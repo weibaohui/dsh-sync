@@ -208,3 +208,70 @@ test('runPush: mirrors live → branch → PR → merge (mocked REST)', async ()
     await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {})
   }
 })
+
+// ── Pre-push reconcile: remote-only pull-back + both-modified reporting ──
+
+test('reconcileRemote: pulls remote-only adds into live, never overwrites local edits', async () => {
+  const tmp = await mkdtemp()
+  const bareRepo = join(tmp, 'remote.git')
+  const repoDir = join(tmp, 'repo')
+  const live = join(tmp, 'live')
+  // seed remote main
+  await sh(['init', '--bare', '-b', 'main', bareRepo])
+  const seed = join(tmp, 'seed')
+  await fsp.mkdir(seed, { recursive: true })
+  await fsp.writeFile(join(seed, '.gitattributes'), '*.jsonl merge=union\n')
+  await sh(['init', '-b', 'main'], seed)
+  await gitNoUser(['add', '-A'], seed)
+  await gitNoUser(['commit', '-m', 'seed'], seed)
+  await sh(['push', bareRepo, 'main'], seed)
+  // live: one local skill + a local settings file
+  await fsp.mkdir(join(live, '.dsh', 'skills', 'foo'), { recursive: true })
+  await fsp.writeFile(join(live, '.dsh', 'skills', 'foo', 'SKILL.md'), '# foo local')
+  await fsp.writeFile(join(live, '.dsh', 'settings.yaml'), 'provider: local-only\n')
+  const roots = {
+    dshSkills: join(live, '.dsh', 'skills'),
+    agentsSkills: join(live, '.nope-agents'),
+    agentsLock: join(live, '.nope-lock'),
+    sessions: join(live, '.nope-s'),
+    settingsFile: join(live, '.dsh', 'settings.yaml'),
+    profiles: join(live, '.nope-p'),
+  }
+  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', syncSkills: true, syncSessions: false, syncSettings: true, syncPlugins: false, token: '' }
+  const state = { instanceId: 'testhost-rec' }
+  try {
+    // 1. shadow clone + baseline = seed commit
+    await I.ensureShadowRepo('git', eff, repoDir)
+    await sh(['fetch', bareRepo, 'main'], repoDir)
+    await sh(['checkout', 'main'], repoDir).catch(() => {})
+    await sh(['reset', '--hard', 'FETCH_HEAD'], repoDir)
+    state.lastSyncedCommit = await I.gitCurrentCommit('git', repoDir)
+    // 2. machine B advances remote main: adds a new skill AND a settings file
+    const peer = join(tmp, 'peer')
+    await sh(['clone', bareRepo, peer])
+    await fsp.mkdir(join(peer, 'skills', 'dsh', 'bar'), { recursive: true })
+    await fsp.mkdir(join(peer, 'settings'), { recursive: true })
+    await fsp.writeFile(join(peer, 'skills', 'dsh', 'bar', 'SKILL.md'), '# bar from peer')
+    await fsp.writeFile(join(peer, 'settings', 'settings.yaml'), 'provider: peer-version\npeerKey: v2\n')
+    await gitNoUser(['add', '-A'], peer)
+    await gitNoUser(['commit', '-m', 'peer adds'], peer)
+    await sh(['push', bareRepo, 'main'], peer)
+    // 3. reconcile
+    const rec = await I.reconcileRemote('git', eff, { repoDir, state, logger: { warn: () => {} }, roots })
+    assert.equal(rec.reconciled, true)
+    // remote-only skill pulled back into live
+    assert.ok(rec.applied.some(p => p === 'skills/dsh/bar/SKILL.md'), 'remote-only add applied: ' + JSON.stringify(rec.applied))
+    assert.equal(fs.readFileSync(join(live, '.dsh', 'skills', 'bar', 'SKILL.md'), 'utf8'), '# bar from peer')
+    // settings changed on both sides → reported, live NOT overwritten
+    assert.ok(rec.bothModified.some(f => f.shadowPath === 'settings/settings.yaml'), 'both-modified reported')
+    assert.equal(fs.readFileSync(join(live, '.dsh', 'settings.yaml'), 'utf8'), 'provider: local-only\n', 'local edit untouched')
+    // 4. subsequent push must keep the peer's new file (no flap deletion)
+    const push = await I.runPush('git', eff, { repoDir, instanceId: state.instanceId, state, logger: { warn: () => {} }, roots })
+    assert.equal(push.pushed, true)
+    const kept = await new Promise((res, rej) => execFile('git', ['show', `${state.lastPushedBranch}:skills/dsh/bar/SKILL.md`], { cwd: repoDir }, (e, o) => e ? rej(e) : res(String(o))))
+    assert.ok(kept.includes('# bar from peer'), 'peer add preserved in push branch (no delete flap)')
+  } finally {
+    await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {})
+  }
+})
+

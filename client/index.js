@@ -99,6 +99,13 @@ const ZH = {
   conflictHint: '检测到未合并的同步 PR（两台机器改了同一文件）。点击下方按钮，AI 会读取本机令牌、分析两边改动、解决冲突并合并 PR。',
   conflictPending: '有未解决的冲突 PR',
   resolveBtn: 'AI 解决冲突',
+  alignBtn: 'AI 智能对齐',
+  alignTitle: 'AI 智能对齐',
+  alignHint: '先自动拉回远端新增内容（不覆盖本机改动），再由 AI 语义合并两边都改过的文件；动手前自动备份本机文件，合并后自动推送，仍冲突的 PR 会顺手解掉。',
+  alignFiles: '待语义合并文件',
+  alignNoFiles: '无双方改动——确定性同步已处理全部差异',
+  alignBackup: '备份目录',
+  reconcileLine: '远端回填 {applied} 项 · 待 AI 对齐 {both} 项',
   openChat: '打开对话',
   running: '执行中…（可能需要几分钟）',
   runDone: '解决完成',
@@ -144,6 +151,13 @@ const EN = {
   conflictHint: 'An unmerged sync PR exists (two machines edited the same file). Click below: the AI reads the local token, analyzes both sides, resolves the conflict and merges the PR.',
   conflictPending: 'Unresolved conflict PR',
   resolveBtn: 'AI resolve conflict',
+  alignBtn: 'AI align',
+  alignTitle: 'AI smart align',
+  alignHint: 'Pulls remote-only changes first (never overwrites local edits), then the AI semantically merges files both sides changed; live files are backed up before merging, the result is pushed automatically, and any still-conflicting PR is resolved in the same run.',
+  alignFiles: 'Files to semantically merge',
+  alignNoFiles: 'No both-side changes — deterministic sync handled everything',
+  alignBackup: 'Backup dir',
+  reconcileLine: 'pulled {applied} remote items · {both} awaiting AI align',
   openChat: 'Open chat',
   running: 'Running… (may take minutes)',
   runDone: 'Resolved',
@@ -249,28 +263,33 @@ function InToast({ text }) {
   return h('div', { className: 'sk-toast' }, text)
 }
 
-// ── Conflict-resolution dialog: AI action button + streamed output ──
-//    (mirrors the skills-management share-run polling pattern)
+// ── Agent-run dialog: action-button pattern for two modes ──
+//    conflict: user opens it, then clicks run (needs pending PR info)
+//    align:    parent already POSTed (which ran a deterministic sync first),
+//              dialog opens with the job streaming and the both-modified list
+//    Both poll the same shape of job endpoint and can open the agent session.
 
-function ConflictDialog({ t, pending, onClose, onToast }) {
-  const [job, setJob] = useState(null)
+function AgentRunDialog({ t, mode, pending, initial, onClose, onToast }) {
+  const align = mode === 'align'
+  const endpoint = align ? API + '/align/run' : API + '/conflict/run'
+  const [job, setJob] = useState(initial && initial.jobId ? { jobId: initial.jobId, status: 'running', output: '', code: null } : null)
   const [busy, setBusy] = useState(false)
   useEffect(() => {
     if (job === null || job.status !== 'running') return
     const timer = setInterval(() => {
-      getJson(API + '/conflict/run?id=' + encodeURIComponent(job.jobId))
+      getJson(endpoint + '?id=' + encodeURIComponent(job.jobId))
         .then(d => setJob(prev => prev && { ...prev, status: d.status, output: d.output || '', code: d.code, sessionId: d.sessionId || prev.sessionId }))
         .catch(() => {})
     }, 2000)
     if (typeof timer.unref === 'function') timer.unref()
     return () => clearInterval(timer)
-  }, [job && job.status])
+  }, [job && job.status, endpoint])
   const doRun = async () => {
     setBusy(true)
     try {
-      const r = await fetch(API + '/conflict/run', {
+      const r = await fetch(endpoint, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ branch: pending && pending.branch, prNumber: pending && pending.prNumber }),
+        body: JSON.stringify(align ? {} : { branch: pending && pending.branch, prNumber: pending && pending.prNumber }),
       })
       const d = await r.json().catch(() => ({}))
       if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
@@ -285,12 +304,19 @@ function ConflictDialog({ t, pending, onClose, onToast }) {
   }
   const row = (label, value) => h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 12, padding: '3px 0' } },
     h('span', { className: 'sk-dir' }, label), h('span', { className: 'sk-hint', style: { wordBreak: 'break-all', textAlign: 'right' } }, value))
-  return h(SkDialog, { title: t('conflictTitle'), onClose, wide: true },
+  const files = initial && Array.isArray(initial.bothModified) ? initial.bothModified : null
+  return h(SkDialog, { title: align ? t('alignTitle') : t('conflictTitle'), onClose, wide: true },
     h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10, minWidth: 380 } },
-      h('div', { className: 'sk-hint' }, t('conflictHint')),
-      pending && h('div', null,
+      h('div', { className: 'sk-hint' }, align ? t('alignHint') : t('conflictHint')),
+      !align && pending && h('div', null,
         row('PR', '#' + (pending.prNumber || '-')),
         row('Branch', pending.branch || '-')),
+      align && h('div', { className: 'sk-card' },
+        h('div', { className: 'sk-dir', style: { marginBottom: 4 } }, t('alignFiles')),
+        files && files.length
+          ? h('pre', { style: { margin: 0, whiteSpace: 'pre-wrap', fontSize: 12, maxHeight: 120, overflow: 'auto' } }, files.join('\n'))
+          : h('div', { className: 'sk-hint' }, t('alignNoFiles')),
+        initial && initial.backupDir && row(t('alignBackup'), initial.backupDir)),
       job !== null && h('div', null,
         h('div', { className: 'sk-dir', style: { margin: '4px 0' } },
           t('outputLabel') + ' · ' + (job.status === 'running' ? t('running') : job.status === 'done' ? t('runDone') : t('runFailed') + (job.code != null ? ' (' + job.code + ')' : ''))),
@@ -298,7 +324,7 @@ function ConflictDialog({ t, pending, onClose, onToast }) {
           job.output || '…')),
       h('div', { className: 'sk-dlg-foot', style: { marginTop: 0 } },
         job !== null && job.sessionId && sessionsSvc() && h(ButtonLite, { onClick: openChat }, t('openChat')),
-        h(ButtonLite, { primary: true, disabled: busy || (job !== null && job.status === 'running'), onClick: doRun },
+        !align && h(ButtonLite, { primary: true, disabled: busy || (job !== null && job.status === 'running'), onClick: doRun },
           job !== null && job.status === 'running' ? t('running') : t('resolveBtn')))))
 }
 
@@ -307,7 +333,10 @@ function ConflictDialog({ t, pending, onClose, onToast }) {
 function SettingsSection({ t }) {
   const [status, setStatus] = useState(null)
   const [busy, setBusy] = useState(false)
+  const [alignBusy, setAlignBusy] = useState(false)
   const [conflictOpen, setConflictOpen] = useState(false)
+  const [alignOpen, setAlignOpen] = useState(false)
+  const [alignInitial, setAlignInitial] = useState(null)
   const [toastText, setToastText] = useState(null)
   const [repoUrl, setRepoUrl] = useState('')
   const [branch, setBranch] = useState('')
@@ -345,6 +374,20 @@ function SettingsSection({ t }) {
       onToast(t('syncDone'), 2600)
     } catch (e) { onToast(t('syncFailed') + ': ' + e.message, 4000) }
     finally { setBusy(false); refresh() }
+  }
+  // AI smart align: POST runs a deterministic sync first (remote-only files
+  // pulled back), then streams the semantic-merge agent run; dialog opens
+  // already running with the both-modified file list.
+  const doAlign = async () => {
+    setAlignBusy(true)
+    try {
+      const r = await fetch(API + '/align/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+      const d = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
+      setAlignInitial({ jobId: d.jobId, bothModified: d.bothModified || [], backupDir: d.backupDir })
+      setAlignOpen(true)
+    } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
+    finally { setAlignBusy(false); refresh() }
   }
   const putSettings = async (patch) => {
     const r = await fetch(API + '/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) })
@@ -395,6 +438,13 @@ function SettingsSection({ t }) {
             row(t('branchLabel'), status.branch || '-'),
             row(t('dirLabel'), status.dir),
             row(t('lastSyncLabel'), status.lastSyncAt ? formatTime(status.lastSyncAt) : t('repoMissing'))),
+          (() => {
+            const rec = status.lastResult && status.lastResult.reconcile
+            const applied = rec && Array.isArray(rec.applied) ? rec.applied.length : 0
+            const both = rec && Array.isArray(rec.bothModified) ? rec.bothModified.length : 0
+            if (!rec || (!applied && !both)) return null
+            return h(Tag, { tone: both ? 'danger' : 'accent' }, t('reconcileLine', { applied, both }))
+          })(),
           h('div', null,
             h('div', { className: 'sk-dir', style: { margin: '4px 0' } }, t('groupHint')),
             h('div', { className: 'sk-toggles' },
@@ -426,7 +476,12 @@ function SettingsSection({ t }) {
           h('div', { className: 'sk-toolbar' },
             h(ButtonLite, { onClick: doSave }, t('save')),
             h('span', { className: 'sk-spacer' }),
-            h(ButtonLite, { primary: true, disabled: busy || status.syncing, onClick: doSync }, busy ? t('syncing') : t('syncNow'))))
+            h(ButtonLite, {
+              disabled: alignBusy || status.syncing || !status.repoUrl || !status.hasToken,
+              title: !status.repoUrl || !status.hasToken ? t('notConfigured') : undefined,
+              onClick: doAlign,
+            }, alignBusy ? t('running') : t('alignBtn')),
+            h(ButtonLite, { primary: true, disabled: busy || status.syncing || alignBusy, onClick: doSync }, busy ? t('syncing') : t('syncNow'))))
   } catch (renderErr) {
     ;(globalThis.__skErrors = globalThis.__skErrors || []).push('body: ' + (renderErr && renderErr.message))
     body = h('div', { className: 'sk-card', style: { color: 'var(--dsw-alias-state-error-primary)' } },
@@ -435,8 +490,11 @@ function SettingsSection({ t }) {
 
   return h('div', { className: 'sk-page' },
     h('div', { className: 'sk-body' }, body),
-    conflictOpen && status && status.pendingConflict && h(ConflictDialog, {
-      t, pending: status.pendingConflict, onClose: () => setConflictOpen(false), onToast,
+    conflictOpen && status && status.pendingConflict && h(AgentRunDialog, {
+      t, mode: 'conflict', pending: status.pendingConflict, onClose: () => setConflictOpen(false), onToast,
+    }),
+    alignOpen && h(AgentRunDialog, {
+      t, mode: 'align', initial: alignInitial, onClose: () => setAlignOpen(false), onToast,
     }),
     toastText && h(InToast, { text: toastText }),
   )
