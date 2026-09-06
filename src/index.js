@@ -489,6 +489,62 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
   return { pulled: true, applied, skipped, changed: changed.length }
 }
 
+// ── Pre-push reconcile: pull remote changes back into live BEFORE the
+//    snapshot push. The push mirror is a full-directory overlay (rm + copy),
+//    so without this step a file another machine added — and this replica
+//    hasn't pulled yet — gets deleted in the push branch and flaps out of
+//    the remote. Remote-only and locally-untouched files are written back
+//    here (purely deterministic, never overwrites local work); files both
+//    sides changed are reported as `bothModified` for the AI align step /
+//    conflict PR. Remote deletions are never mirrored into live. ──
+
+async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
+  const fs = require('node:fs')
+  try { await fs.promises.access(join(repoDir, '.git')) } catch { return { reconciled: false, noShadow: true } }
+  const remote = authedUrl(eff.repoUrl, eff.token)
+  const spec = syncSpec(eff, roots)
+  try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
+    if (!/Could not find|doesn't exist|no such|empty/i.test(String(e && e.message))) throw e
+    return { reconciled: false, empty: true }
+  }
+  const hasFetch = await gitExec(binary, ['rev-parse', '--verify', 'FETCH_HEAD'], repoDir).then(() => true).catch(() => false)
+  if (!hasFetch) return { reconciled: false, empty: true }
+  const lastSynced = state.lastSyncedCommit
+  if (!lastSynced) {
+    // never synced: nothing to diff against; just record the baseline
+    await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
+    await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
+    state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
+    return { reconciled: false, firstBaseline: true }
+  }
+  let changedRaw = ''
+  try { changedRaw = await gitExec(binary, ['diff', '--name-only', lastSynced, 'FETCH_HEAD'], repoDir) } catch {}
+  const changed = changedRaw.split(/\r?\n/).map(s => s.trim()).filter(Boolean)
+  const applied = []        // safely written back to live
+  const bothModified = []   // both sides changed → AI align / conflict PR
+  const remoteDeleted = []  // gone on remote; live keeps its copy
+  for (const p of changed) {
+    const livePath = resolveLivePath(spec, p)
+    if (!livePath) continue
+    let remoteBuf = null
+    try { remoteBuf = await gitShowBuf(binary, `FETCH_HEAD:${p}`, repoDir) } catch { remoteBuf = null }
+    if (remoteBuf === null) { remoteDeleted.push(p); continue }
+    let liveBuf = null
+    try { liveBuf = await fsP.readFile(livePath) } catch {}
+    let lastSyncedBuf = null
+    try { lastSyncedBuf = await gitShowBuf(binary, `${lastSynced}:${p}`, repoDir) } catch { lastSyncedBuf = Buffer.alloc(0) }
+    const untouched = liveBuf === null ? (lastSyncedBuf.length === 0) : Buffer.compare(liveBuf, lastSyncedBuf) === 0
+    if (!untouched) { bothModified.push({ shadowPath: p, livePath }); continue }
+    try { await atomicWriteFile(livePath, remoteBuf); applied.push(p) } catch {}
+  }
+  // advance shadow baseline to FETCH_HEAD — safe items now match live, so the
+  // subsequent push overlay keeps every remote-only file instead of deleting it
+  await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
+  await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
+  state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
+  return { reconciled: true, applied, bothModified, remoteDeleted, changed: changed.length }
+}
+
 // ── Conflict-resolution action button: in-process agent (same channel as
 //    skills-management share-run). The agent operates the shadow repo's git
 //    directly + merges the PR via REST. Only this step needs semantic
@@ -532,6 +588,46 @@ function substituteParams(template, params) {
   return out
 }
 
+// ── AI align action button: semantic merge of files both sides changed.
+//    Deterministic reconcile (remote-only pull-back) already ran in the host
+//    before this prompt is built; the agent only does the semantic judgement
+//    on the reported both-modified files, then triggers a normal sync and
+//    falls back to conflict resolution if a PR still can't merge. ──
+
+const ALIGN_PROMPT_ZH = [
+  '请执行 dsh-sync 的「AI 智能对齐」：把本机与远端都改过的文件做语义合并，然后触发一次同步完成推送。',
+  '',
+  '## 路径信息',
+  '- 影子仓库（git 工作树，只读用于取版本）：{{shadowDir}}',
+  '- 本机 live 同步根：',
+  '  - 技能（dsh）：{{skillsDsh}}',
+  '  - 技能（agents）：{{skillsAgents}}',
+  '  - 会话：{{sessions}}',
+  '  - 设置文件：{{settingsFile}}',
+  '  - 插件清单：{{profiles}}',
+  '- 影子路径 → live 路径映射：`skills/dsh/**` → 技能（dsh）根；`skills/agents/**` → 技能（agents）根；`skills/.skill-lock.json` → agents 根下 `.skill-lock.json`；`sessions/**` → 会话根；`settings/settings.yaml` → 设置文件；`plugins/**` → 插件清单根。',
+  '- 备份目录：{{backupDir}}（改动前把 live 原文件按影子相对路径复制进去）',
+  '- 本机 dsh web 地址：{{apiBase}}（用它触发同步，不需要令牌）',
+  '- 访问令牌：{{token}}（仅兜底直接调 GitCode API 时用，严禁回显）',
+  '',
+  '## 待合并文件（两边都改过，共 {{fileCount}} 个）',
+  '{{fileList}}',
+  '每个文件的三个版本：本机版直接读 live 路径；远端版 `git -C {{shadowDir}} show FETCH_HEAD:<影子路径>`；共同基线 `git -C {{shadowDir}} show {{lastSynced}}:<影子路径>`（可能不存在）。',
+  '',
+  '## 规则（硬性）',
+  '1. 只允许修改上面清单里的 live 文件；**不得删除**任何 live 文件或远端独有内容；不准碰同步根之外的文件。',
+  '2. 动手前把每个 live 原文件备份到 {{backupDir}}（保持影子相对路径的子目录结构）。',
+  '3. 文本文件（.md/.json/.yaml/.yml/明文 .jsonl）做三方语义合并，保留两边有效改动。技能/专家目录：两边各自新增的文件取并集（都保留），仅同名文件才合并内容。',
+  '4. settings.yaml 逐键保留双方；本机路径/机器相关字段以本机为准；任何 token/apiKey/密钥字段保留两边但**严禁在输出中回显密钥值**。',
+  '5. 二进制或压缩文件（.zst/.gz 及 session 日志二进制）不合并，保留本机版，在汇报里列出。',
+  '6. 只允许使用 bash 与 HTTP 请求工具；严禁使用 return/deliver/投递/IM 文件类工具；不要 printenv；令牌不得出现在任何输出或提交信息里。',
+  '7. 合并完成后触发确定性同步：`curl -s -X POST {{apiBase}}/dsh-sync/api/sync`，等待返回 JSON。',
+  '8. 再查状态：`curl -s {{apiBase}}/dsh-sync/api/status`。若 pendingConflict 非空（仍有冲突 PR）：在影子仓库 `git fetch https://oauth2:<令牌>@gitcode.com/<owner>/<repo>.git <分支>` → checkout 该分支 → `git merge FETCH_HEAD` → 按上述规则解冲突 → `git add -A && git -c user.name=dsh-sync -c user.email=dsh-sync@local commit --no-edit` → push 回该分支 → 调 GitCode API 合并 PR（头用 `PRIVATE-TOKEN: <令牌>`，不要用 Authorization: Bearer；`PUT /repos/<owner>/<repo>/pulls/<编号>/merge`，body `{"merge_method":"squash"}`）。',
+  '9. 全程使用中文。最后汇报：备份了哪些文件、每个文件怎么合并的、同步触发结果、PR 编号与链接（若有）。',
+  '',
+  '若待合并文件清单为空，跳过合并直接执行第 7 步，并汇报同步结果。',
+].join('\n')
+
 // apiproxy client: dsh web 的 /api HTTP RPC（web 客户端同款），创建主对话级 session。
 // 关键区别：apiproxy session.create 建的是 web 主对话级 agent（agentPreset=standard
 // + dsh-base 全工具，含 bash——实测 tool/call=bash + pwd 跑通）；而 agents.create 子 agent
@@ -551,7 +647,7 @@ async function apiproxy(method, payload) {
   return res.value
 }
 
-async function runConflictViaApiproxy({ prompt, dir, job, sessions, logger, token }) {
+async function runAgentViaApiproxy({ prompt, dir, job, sessions, logger, token }) {
   // token 经 prompt 内联（{{token}}）--apiproxy 主对话级 session 的 bash 是 host-plane
   // executor，不继承 dsh web 进程的 process.env，故不能像 headless spawn 那样 env 注入
   try {
@@ -611,18 +707,18 @@ async function runConflictViaApiproxy({ prompt, dir, job, sessions, logger, toke
   return job
 }
 
-function createConflictRunJob({ prompt, dir, jobs, logger, sessions, token }) {
-  const id = 'cf' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+function createAgentRunJob({ prompt, dir, jobs, logger, sessions, token }) {
+  const id = 'ag' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
   const job = { id, status: 'running', startedAt: new Date().toISOString(), dir, output: '', code: null }
   jobs.set(id, job)
   // 走 apiproxy 创建主对话级 session（standard preset + dsh-base 全工具，含 bash），
-  // 不是 agents.create 子 agent（精简无 bash）。token 注入 env，events 经 ctx.sessions.get 流式读。
+  // 不是 agents.create 子 agent（精简无 bash）。token 注入 prompt，events 经 ctx.sessions.get 流式读。
   if (!sessions || typeof sessions.get !== 'function') {
     job.status = 'error'
     job.output = 'sessions 服务不可用（动态 ctx.inject 失败）'
     return job
   }
-  runConflictViaApiproxy({ prompt, dir, job, sessions, logger, token })
+  runAgentViaApiproxy({ prompt, dir, job, sessions, logger, token })
     .catch(e => { job.status = 'error'; job.output = (job.output + '\n' + String(e && e.message)).slice(-CONFLICT_RUN_OUTPUT_CAP) })
   return job
 }
@@ -630,7 +726,7 @@ function createConflictRunJob({ prompt, dir, jobs, logger, sessions, token }) {
 module.exports = {
   name: 'dsh-sync',
   inject: ['webServer', 'settings'],
-  __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, substituteParams },
+  __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, substituteParams },
 
   apply(ctx, config = {}) {
     const dh = dshHome()
@@ -709,6 +805,9 @@ module.exports = {
         let result = { pushed: false, pulled: false }
         try {
           const ctx2 = { repoDir, instanceId: state.instanceId, state, logger: ctx.logger }
+          // reconcile first: pull remote-only/untouched changes into live so
+          // the full-snapshot push below never deletes another replica's adds
+          result.reconcile = await reconcileRemote(eff.gitBinary, eff, ctx2).catch(e => { result.reconcileError = String(e && e.message); return null })
           result.push = await runPush(eff.gitBinary, eff, ctx2).catch(e => { result.pushError = String(e && e.message); return null })
           result.pull = await runPull(eff.gitBinary, eff, ctx2).catch(e => { result.pullError = String(e && e.message); return null })
           state.lastSyncAt = new Date().toISOString()
@@ -720,9 +819,11 @@ module.exports = {
       return syncRun
     }
 
-    // ── Conflict-resolution jobs (action button → apiproxy 主对话级 session) ──
+    // ── Agent-run jobs (action buttons → apiproxy 主对话级 session) ──
+    // conflictRunJobs: 冲突 PR 解决；alignRunJobs: AI 智能对齐（语义合并双方改动）
     const conflictRunJobs = new Map()
-    // 动态注入 sessions 服务：conflict 走 apiproxy 创建主对话级 session 后，
+    const alignRunJobs = new Map()
+    // 动态注入 sessions 服务：agent run 走 apiproxy 创建主对话级 session 后，
     // 用 ctx.sessions.get(sessionId).events 流式读 agent 输出（像 agents.create 事件泵，
     // 但这个 agent 有 bash）
     let sessionsSvc = null
@@ -830,7 +931,7 @@ module.exports = {
             const prompt = substituteParams(CONFLICT_PROMPT_ZH, {
               repoUrl: eff.repoUrl, shadowDir: repoDir, branch, prNumber, token: eff.token,
             })
-            const job = createConflictRunJob({ prompt, dir: repoDir, jobs: conflictRunJobs, logger: ctx.logger, sessions: sessionsSvc, token: eff.token })
+            const job = createAgentRunJob({ prompt, dir: repoDir, jobs: conflictRunJobs, logger: ctx.logger, sessions: sessionsSvc, token: eff.token })
             sendJson(res, 202, { jobId: job.id, status: job.status })
             return
           }
@@ -839,6 +940,51 @@ module.exports = {
           if (req.method === 'GET' && apiPath.endsWith('/dsh-sync/api/conflict/run')) {
             const id = query.get('id') || ''
             const job = conflictRunJobs.get(id)
+            if (job === undefined) { sendJson(res, 404, { error: 'job not found' }); return }
+            sendJson(res, 200, { ...job, output: (job.output || '').slice(-32 * 1024) })
+            return
+          }
+
+          // POST /dsh-sync/api/align/run → AI 智能对齐：先跑一次确定性同步
+          // （远端新增自动回填），再把两边都改过的文件交 agent 语义合并
+          if (req.method === 'POST' && apiPath.endsWith('/dsh-sync/api/align/run')) {
+            await stateLoaded
+            const eff = syncSettings()
+            if (!eff.repoUrl || !eff.token) { sendJson(res, 400, { error: '未配置仓库或令牌' }); return }
+            const baseCommit = state.lastSyncedCommit   // 双方分叉的共同基线（reconcile 前）
+            let syncResult = null
+            try { syncResult = await runSync() }
+            catch (e) { sendJson(res, 400, { error: '同步预检失败：' + String(e && e.message || e) }); return }
+            const rec = syncResult && syncResult.reconcile
+            const both = (rec && Array.isArray(rec.bothModified)) ? rec.bothModified : []
+            const fileList = both.length
+              ? both.map((f, i) => `${i + 1}. ${f.shadowPath}（本机：${displayPath(f.livePath)}）`).join('\n')
+              : '（无——确定性同步已处理全部差异）'
+            const roots = defaultRoots()
+            const backupDir = join(syncDir, 'align-backups', new Date().toISOString().replace(/[:.]/g, '-'))
+            await fsP.mkdir(backupDir, { recursive: true })
+            const prompt = substituteParams(ALIGN_PROMPT_ZH, {
+              shadowDir: repoDir,
+              skillsDsh: roots.dshSkills, skillsAgents: roots.agentsSkills,
+              sessions: roots.sessions, settingsFile: roots.settingsFile, profiles: roots.profiles,
+              backupDir, apiBase: APIPROXY_BASE, token: eff.token,
+              fileCount: both.length, fileList,
+              lastSynced: baseCommit || '（无共同基线，仓库首次同步）',
+            })
+            const job = createAgentRunJob({ prompt, dir: repoDir, jobs: alignRunJobs, logger: ctx.logger, sessions: sessionsSvc, token: eff.token })
+            sendJson(res, 202, {
+              jobId: job.id, status: job.status,
+              bothModified: both.map(f => f.shadowPath),
+              backupDir: displayPath(backupDir),
+              reconcile: rec ? { applied: rec.applied, bothModified: rec.bothModified.length, remoteDeleted: rec.remoteDeleted } : null,
+            })
+            return
+          }
+
+          // GET /dsh-sync/api/align/run?id= → job status/output
+          if (req.method === 'GET' && apiPath.endsWith('/dsh-sync/api/align/run')) {
+            const id = query.get('id') || ''
+            const job = alignRunJobs.get(id)
             if (job === undefined) { sendJson(res, 404, { error: 'job not found' }); return }
             sendJson(res, 200, { ...job, output: (job.output || '').slice(-32 * 1024) })
             return
