@@ -81,12 +81,20 @@ window.__ModuleLoader__.load({
       syncFailed: '同步失败',
       save: '保存',
       saved: '设置已保存',
+      cancel: '取消',
       repoUrlLabel: '仓库地址',
       branchLabel: '分支',
       instanceLabel: '实例 ID',
       lastSyncLabel: '上次同步',
       dirLabel: '本地镜像目录',
       gitMissing: '未检测到 git',
+      ignoreLabel: '忽略清单',
+      ignoreHint: '语法同 .gitignore；本机独立、不随同步上传，编辑后即时生效',
+      editIgnore: '编辑',
+      ignoreDialogTitle: '维护忽略清单',
+      ignoreDialogHint: '每行一条规则（语法同 .gitignore）；设为本机不同步的内容，保存后即时生效',
+      ignoreReset: '恢复默认',
+      ignoreSaved: '已保存',
       repoMissing: '尚未初始化，点「立即同步」',
       notConfigured: '未配置仓库地址或访问令牌',
       tokenLabel: 'GitCode 访问令牌',
@@ -123,6 +131,28 @@ window.__ModuleLoader__.load({
       outputLabel: '输出',
       repoUrlPlaceholder: 'https://gitcode.com/<owner>/<repo>.git',
       operationFailed: '操作失败',
+      // update detection
+      checkCardTitle: '更新检测',
+      checkHint: '自动检测本机改动与远端更新（类似 git status / fetch）；检测到变化建议及时同步',
+      checkNow: '检查',
+      checkingNow: '检查中…',
+      lastCheck: '上次检测',
+      localClean: '本机无待同步改动',
+      localDirty: '本地 {count} 个文件待同步',
+      remoteClean: '远端无更新',
+      remoteBehind: '远端有 {n} 个新提交',
+      noBaseline: '尚无同步基线，先同步一次',
+      baselineLost: '基线提交已丢失（远端可能被强推），同步一次重建',
+      checkError: '检测失败',
+      kindA: '新增',
+      kindM: '修改',
+      kindD: '删除',
+      filesTotal: '共 {n} 个文件',
+      commitsLabel: '提交记录',
+      localLabel: '本机',
+      remoteLabel: '远端',
+      checkIntervalLabel: '检测间隔（分钟）',
+      watchLocalLabel: '监视本地文件变化',
     }
 
     const EN = {
@@ -133,12 +163,20 @@ window.__ModuleLoader__.load({
       syncFailed: 'Sync failed',
       save: 'Save',
       saved: 'Settings saved',
+      cancel: 'Cancel',
       repoUrlLabel: 'Repository URL',
       branchLabel: 'Branch',
       instanceLabel: 'Instance ID',
       lastSyncLabel: 'Last sync',
       dirLabel: 'Local mirror dir',
       gitMissing: 'git not found',
+      ignoreLabel: 'Ignore list',
+      ignoreHint: 'gitignore syntax; per-machine, not synced — edits take effect immediately',
+      editIgnore: 'Edit',
+      ignoreDialogTitle: 'Maintain ignore list',
+      ignoreDialogHint: 'One rule per line (gitignore syntax); things you do NOT want synced. Save applies immediately.',
+      ignoreReset: 'Reset to default',
+      ignoreSaved: 'Saved',
       repoMissing: 'Not initialized — hit Sync now',
       notConfigured: 'Repo URL or access token not configured',
       tokenLabel: 'GitCode access token',
@@ -175,6 +213,28 @@ window.__ModuleLoader__.load({
       outputLabel: 'Output',
       repoUrlPlaceholder: 'https://gitcode.com/<owner>/<repo>.git',
       operationFailed: 'Operation failed',
+      // update detection
+      checkCardTitle: 'Update detection',
+      checkHint: 'Watches local pending changes and remote updates (like git status / fetch); sync soon after changes show up',
+      checkNow: 'Check',
+      checkingNow: 'Checking…',
+      lastCheck: 'Last check',
+      localClean: 'No pending local changes',
+      localDirty: '{count} local files pending sync',
+      remoteClean: 'Remote up to date',
+      remoteBehind: '{n} new remote commits',
+      noBaseline: 'No sync baseline yet — run a sync first',
+      baselineLost: 'Baseline commit lost (remote force-pushed?) — run a sync to rebuild',
+      checkError: 'Check failed',
+      kindA: 'added',
+      kindM: 'modified',
+      kindD: 'deleted',
+      filesTotal: '{n} files total',
+      commitsLabel: 'Commits',
+      localLabel: 'Local',
+      remoteLabel: 'Remote',
+      checkIntervalLabel: 'Check interval (minutes)',
+      watchLocalLabel: 'Watch local file changes',
     }
 
     // ── Pure helpers ────────────────────────────────────────────────────────
@@ -236,6 +296,16 @@ window.__ModuleLoader__.load({
     .sk-input:focus{border-color:var(--dsw-alias-state-business-primary)}
     .sk-input::placeholder{color:var(--dsw-alias-label-tertiary)}
     .sk-toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:40;background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-primary);border:1px solid var(--dsw-alias-border-l2);border-radius:999px;padding:8px 18px;font-size:13px;box-shadow:var(--dsw-shadow-lv2)}
+    .sk-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:4px 0}
+    .sk-clickable{cursor:pointer;user-select:none}
+    .sk-filelist{display:flex;flex-direction:column;gap:2px;max-height:200px;overflow:auto;padding:8px 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-2)}
+    .sk-filerow{display:flex;gap:8px;align-items:baseline}
+    .sk-filekind{flex:none;min-width:38px;text-align:center;border-radius:4px;padding:0 4px;font-size:11px;border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary)}
+    .sk-filekind.k-A{color:var(--dsw-alias-state-business-primary);border-color:var(--dsw-alias-state-business-primary)}
+    .sk-filekind.k-D{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}
+    .sk-filepath{color:var(--dsw-alias-label-secondary);word-break:break-all;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px}
+    .sk-commitrow{display:flex;gap:8px;flex-wrap:wrap;font-size:12px;color:var(--dsw-alias-label-secondary);padding:1px 0}
+    .sk-commitrow .h{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dsw-alias-label-tertiary)}
     </style>`
 
     // ── Fetch layer ─────────────────────────────────────────────────────────
@@ -338,6 +408,126 @@ window.__ModuleLoader__.load({
               job !== null && job.status === 'running' ? t('running') : t('resolveBtn')))))
     }
 
+    // ── Update detection status card: local pending changes + remote updates ──
+    //    Renders cached check results from /status (git-status style A/M/D for
+    //    local, behind-count + commit list for remote). The card never triggers
+    //    heavy work itself; 「检查」hits POST /check, 「立即同步」runs a full sync.
+
+    function CheckFileList({ t, files, filesTotal }) {
+      return h('div', { className: 'sk-filelist' },
+        (files || []).map(f => h('div', { key: f.kind + ':' + f.path, className: 'sk-filerow' },
+          h('span', { className: 'sk-filekind k-' + f.kind }, t('kind' + f.kind)),
+          h('span', { className: 'sk-filepath' }, f.path))),
+        filesTotal ? h('div', { className: 'sk-dir' }, t('filesTotal', { n: filesTotal })) : null)
+    }
+
+    function UpdateStatusCard({ t, status, onCheck, onSync, syncBusy }) {
+      const [exp, setExp] = useState({})
+      const lc = status.localCheck || null
+      const rc = status.remoteCheck || null
+      const checking = status.checking || {}
+      const checkBusy = !!(checking.local || checking.remote)
+      const dirty = !!(lc && lc.dirty === true && !lc.disabled && !lc.error)
+      const behind = !!(rc && !rc.disabled && !rc.error && typeof rc.behind === 'number' && rc.behind > 0)
+      const needsSync = dirty || behind
+      const lastAt = [lc && lc.at, rc && rc.at].filter(Boolean).sort().pop()
+      const toggle = (k) => setExp(p => ({ ...p, [k]: !p[k] }))
+
+      let localTag, localDetail = null
+      if (!lc) localTag = h('span', { className: 'sk-dir' }, '…')
+      else if (lc.disabled === 'no-baseline') localTag = h('span', { className: 'sk-dir' }, t('noBaseline'))
+      else if (lc.disabled === 'no-repo') localTag = h('span', { className: 'sk-dir' }, t('repoMissing'))
+      else if (lc.disabled === 'no-groups') localTag = h('span', { className: 'sk-dir' }, t('groupHint'))
+      else if (lc.error) localTag = h('span', { className: 'sk-dir', style: { color: 'var(--dsw-alias-state-error-primary)' } },
+        t('checkError') + ': ' + String(lc.error).slice(0, 160))
+      else if (dirty) {
+        const c = lc.counts || {}
+        localTag = h('span', { className: 'sk-clickable', onClick: () => toggle('local'), style: { display: 'inline-flex', alignItems: 'center', gap: 6 } },
+          h(Tag, { tone: 'accent' }, t('localDirty', { count: lc.filesTotal || (lc.files || []).length })),
+          h('span', { className: 'sk-dir' }, '+' + (c.added || 0) + ' · ~' + (c.modified || 0) + ' · -' + (c.deleted || 0)),
+          h('span', { className: 'sk-dir' }, exp.local ? '▾' : '▸'))
+        if (exp.local) localDetail = h(CheckFileList, { t, files: lc.files, filesTotal: lc.filesTotal })
+      } else localTag = h('span', { className: 'sk-dir' }, t('localClean'))
+
+      let remoteTag, remoteDetail = null
+      if (!rc) remoteTag = h('span', { className: 'sk-dir' }, '…')
+      else if (rc.disabled === 'not-configured') remoteTag = h('span', { className: 'sk-dir' }, t('notConfigured'))
+      else if (rc.disabled === 'no-repo') remoteTag = h('span', { className: 'sk-dir' }, t('repoMissing'))
+      else if (rc.disabled === 'no-baseline') remoteTag = h('span', { className: 'sk-dir' }, t('noBaseline'))
+      else if (rc.disabled === 'baseline-lost') remoteTag = h('span', { className: 'sk-dir' }, t('baselineLost'))
+      else if (rc.error) remoteTag = h('span', { className: 'sk-dir', style: { color: 'var(--dsw-alias-state-error-primary)' } },
+        t('checkError') + ': ' + String(rc.error).slice(0, 160))
+      else if (behind) {
+        remoteTag = h('span', { className: 'sk-clickable', onClick: () => toggle('remote'), style: { display: 'inline-flex', alignItems: 'center', gap: 6 } },
+          h(Tag, { tone: 'accent' }, t('remoteBehind', { n: rc.behind })),
+          h('span', { className: 'sk-dir' }, (rc.filesTotal || (rc.files || []).length) + ' files'),
+          h('span', { className: 'sk-dir' }, exp.remote ? '▾' : '▸'))
+        if (exp.remote) remoteDetail = h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+          (rc.commits || []).length > 0 && h('div', { className: 'sk-filelist', style: { maxHeight: 130 } },
+            h('div', { className: 'sk-dir' }, t('commitsLabel')),
+            rc.commits.map(c => h('div', { key: c.hash, className: 'sk-commitrow' },
+              h('span', { className: 'h' }, c.hash),
+              h('span', null, c.author),
+              h('span', { className: 'h' }, formatTime(c.at)),
+              h('span', { style: { wordBreak: 'break-all' } }, c.subject)))),
+          h(CheckFileList, { t, files: rc.files, filesTotal: rc.filesTotal }))
+      } else remoteTag = h('span', { className: 'sk-dir' }, t('remoteClean'))
+
+      return h('div', { className: 'sk-card' },
+        h('div', { className: 'sk-head' },
+          h('span', { className: 'sk-dir' }, t('checkCardTitle')),
+          lastAt && h('span', { className: 'sk-dir' }, t('lastCheck') + ' ' + formatTime(lastAt)),
+          h('span', { className: 'sk-spacer' }),
+          needsSync && h(ButtonLite, { primary: true, small: true, disabled: syncBusy, onClick: onSync }, syncBusy ? t('syncing') : t('syncNow')),
+          h(ButtonLite, { small: true, disabled: checkBusy, onClick: onCheck }, checkBusy ? t('checkingNow') : t('checkNow'))),
+        h('div', { className: 'sk-dir', style: { marginTop: -4 } }, t('checkHint')),
+        h('div', { className: 'sk-row' }, h('span', { className: 'sk-dir', style: { minWidth: 56 } }, t('localLabel')), localTag),
+        localDetail,
+        h('div', { className: 'sk-row' }, h('span', { className: 'sk-dir', style: { minWidth: 56 } }, t('remoteLabel')), remoteTag),
+        remoteDetail)
+    }
+
+    // ── Ignore-list maintenance dialog: view/edit the per-machine .gitignore ──
+    //    GET /ignore for current content + default template; PUT saves it back.
+    //    The host writes the file atomically and refreshes detection in the
+    //    background, so saved rules apply to the next check without a restart.
+
+    function IgnoreDialog({ t, onClose, onSaved, onToast }) {
+      const [content, setContent] = useState('')
+      const [def, setDef] = useState('')
+      const [path, setPath] = useState('')
+      const [busy, setBusy] = useState(false)
+      useEffect(() => {
+        getJson(API + '/ignore').then(d => {
+          setContent(d.content || '')
+          setDef(d.default || '')
+          setPath(d.path || '')
+        }).catch(() => {})
+      }, [])
+      const save = async (c) => {
+        setBusy(true)
+        try {
+          const r = await fetch(API + '/ignore', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: c }) })
+          const d = await r.json().catch(() => ({}))
+          if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
+          setContent(c)
+          onToast(t('ignoreSaved'), 2200)
+          onSaved()
+        } catch (e) { onToast(t('operationFailed') + ': ' + e.message, 4000) } finally { setBusy(false) }
+      }
+      return h(SkDialog, { title: t('ignoreDialogTitle'), onClose, wide: true },
+        h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10, minWidth: 480 } },
+          path && h('div', { className: 'sk-dir' }, t('ignoreLabel') + ': ' + path),
+          h('div', { className: 'sk-hint' }, t('ignoreDialogHint')),
+          h('textarea', { className: 'sk-input', rows: 16, spellCheck: false, value: content, onChange: e => setContent(e.target.value),
+            style: { width: '100%', fontFamily: 'ui-monospace,SFMono-Regular,Menlo,monospace', fontSize: 12.5, resize: 'vertical' } }),
+          h('div', { className: 'sk-dlg-foot', style: { marginTop: 0 } },
+            h(ButtonLite, { small: true, onClick: () => setContent(def) }, t('ignoreReset')),
+            h('span', { className: 'sk-spacer' }),
+            h(ButtonLite, { onClick: onClose }, t('cancel')),
+            h(ButtonLite, { primary: true, disabled: busy, onClick: () => save(content) }, t('save')))))
+    }
+
     // ── Settings section: the single entrance (host settings page section) ──
 
     function SettingsSection({ t }) {
@@ -347,6 +537,7 @@ window.__ModuleLoader__.load({
       const [conflictOpen, setConflictOpen] = useState(false)
       const [alignOpen, setAlignOpen] = useState(false)
       const [alignInitial, setAlignInitial] = useState(null)
+      const [ignoreOpen, setIgnoreOpen] = useState(false)
       const [toastText, setToastText] = useState(null)
       const [repoUrl, setRepoUrl] = useState('')
       const [branch, setBranch] = useState('')
@@ -355,6 +546,8 @@ window.__ModuleLoader__.load({
       const [autoSync, setAutoSync] = useState(true)
       const [syncOnStartup, setSyncOnStartup] = useState(false)
       const [conflictMode, setConflictMode] = useState('ai')
+      const [checkIntervalMinutes, setCheckIntervalMinutes] = useState(5)
+      const [watchLocalChanges, setWatchLocalChanges] = useState(true)
       const [g, setG] = useState({ skills: true, sessions: false, settings: true, plugins: true })
 
       const onToast = (text, ms = 3000) => { setToastText(text); setTimeout(() => setToastText(null), ms) }
@@ -366,10 +559,17 @@ window.__ModuleLoader__.load({
         setAutoSync(d.autoSync)
         setSyncOnStartup(d.syncOnStartup)
         setConflictMode(d.conflictMode)
+        setCheckIntervalMinutes(typeof d.checkIntervalMinutes === 'number' ? d.checkIntervalMinutes : 5)
+        setWatchLocalChanges(d.watchLocalChanges !== false)
         setG({ skills: d.syncSkills, sessions: d.syncSessions, settings: d.syncSettings, plugins: d.syncPlugins })
       }).catch(() => {})
+      // 立即检查：触发服务端当场跑一次本地/远端检测（打开设置页即拿新鲜结果）
+      const doCheck = () => fetch(API + '/check', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+      }).then(r => r.json()).catch(() => ({})).finally(refresh)
       useEffect(() => {
         refresh()
+        doCheck()
         const timer = setInterval(refresh, 15000)
         if (typeof timer.unref === 'function') timer.unref()
         return () => clearInterval(timer)
@@ -407,7 +607,7 @@ window.__ModuleLoader__.load({
       }
       const doSave = async () => {
         try {
-          const patch = { repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode, syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins }
+          const patch = { repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode, checkIntervalMinutes, watchLocalChanges, syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins }
           if (token !== '') patch.token = token
           await putSettings(patch)
           setToken('')
@@ -438,6 +638,9 @@ window.__ModuleLoader__.load({
                   h('span', { className: 'sk-spacer' }),
                   h(ButtonLite, { primary: true, small: true, onClick: () => setConflictOpen(true) }, t('resolveBtn'))),
                 h('div', { className: 'sk-hint' }, t('conflictHint'))),
+              status.repoExists !== false && h(UpdateStatusCard, {
+                t, status, onCheck: doCheck, onSync: doSync, syncBusy: busy || status.syncing,
+              }),
               h('div', { className: 'sk-card' },
                 h('div', { className: 'sk-head' },
                   h('span', { className: 'sk-dir' }, t('instanceLabel')),
@@ -447,7 +650,11 @@ window.__ModuleLoader__.load({
                 row(t('repoUrlLabel'), status.repoUrl || '-'),
                 row(t('branchLabel'), status.branch || '-'),
                 row(t('dirLabel'), status.dir),
-                row(t('lastSyncLabel'), status.lastSyncAt ? formatTime(status.lastSyncAt) : t('repoMissing'))),
+                row(t('ignoreLabel'), status.ignoreFile || '-'),
+                row(t('lastSyncLabel'), status.lastSyncAt ? formatTime(status.lastSyncAt) : t('repoMissing')),
+                h('div', { className: 'sk-dir', style: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 2 } },
+                  h('span', null, t('ignoreHint')),
+                  h(ButtonLite, { small: true, onClick: () => setIgnoreOpen(true) }, t('editIgnore')))),
               (() => {
                 const rec = status.lastResult && status.lastResult.reconcile
                 const applied = rec && Array.isArray(rec.applied) ? rec.applied.length : 0
@@ -466,7 +673,11 @@ window.__ModuleLoader__.load({
                 h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
                   h('input', { type: 'checkbox', checked: syncOnStartup, onChange: e => setSyncOnStartup(e.target.checked) }), t('syncOnStartupLabel')),
                 h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
-                  t('intervalLabel'), h('input', { className: 'sk-input', type: 'number', min: 5, value: intervalMinutes, onChange: e => setIntervalMinutes(Math.max(1, Number(e.target.value) || 30)), style: { width: 80 } }))),
+                  h('input', { type: 'checkbox', checked: watchLocalChanges, onChange: e => setWatchLocalChanges(e.target.checked) }), t('watchLocalLabel')),
+                h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
+                  t('intervalLabel'), h('input', { className: 'sk-input', type: 'number', min: 5, value: intervalMinutes, onChange: e => setIntervalMinutes(Math.max(1, Number(e.target.value) || 30)), style: { width: 80 } })),
+                h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
+                  t('checkIntervalLabel'), h('input', { className: 'sk-input', type: 'number', min: 1, value: checkIntervalMinutes, onChange: e => setCheckIntervalMinutes(Math.max(1, Number(e.target.value) || 5)), style: { width: 80 } }))),
               h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
                 h('input', { className: 'sk-input', value: repoUrl, onChange: e => setRepoUrl(e.target.value), placeholder: t('repoUrlPlaceholder'), style: { width: '100%' } }),
                 h('input', { className: 'sk-input', value: branch, onChange: e => setBranch(e.target.value), placeholder: t('branchLabel'), style: { width: '100%' } }),
@@ -505,6 +716,10 @@ window.__ModuleLoader__.load({
         }),
         alignOpen && h(AgentRunDialog, {
           t, mode: 'align', initial: alignInitial, onClose: () => setAlignOpen(false), onToast,
+        }),
+        ignoreOpen && h(IgnoreDialog, {
+          t, onClose: () => setIgnoreOpen(false), onToast,
+          onSaved: () => { doCheck(); refresh() },
         }),
         toastText && h(InToast, { text: toastText }),
       )

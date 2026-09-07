@@ -24,6 +24,7 @@
 
 const { execFile } = require('node:child_process')
 const { randomUUID } = require('node:crypto')
+const fsSync = require('node:fs')
 const fsP = require('node:fs/promises')
 const { join, relative, resolve, sep } = require('node:path')
 const { homedir, hostname } = require('node:os')
@@ -61,6 +62,80 @@ const DEFAULT_SYNC_SETTINGS = {
   syncSessions: false,
   syncSettings: true,
   syncPlugins: true,
+  // Update detection: periodic + fs.watch-driven checks for local pending
+  // changes and remote updates, surfaced in the settings page status card.
+  checkIntervalMinutes: 5,
+  watchLocalChanges: true,
+}
+
+// Update-detection tunables
+const CHECK_FILE_LIST_CAP = 50            // files reported per check (status payload)
+const CHECK_COMMITS_CAP = 20              // remote commits reported per check
+const WATCH_DEBOUNCE_MS = 2000            // fs.watch noise settles before a check
+
+// ── Per-machine ignore list (a .gitignore for what NOT to sync) ──
+//    The canonical file lives OUTSIDE the shadow worktree at
+//    $DSH_HOME/dsh-sync/.gitignore — per-machine and never synced. It is wired
+//    into the shadow repo as `core.excludesFile`, so git's own ignore engine
+//    (negation !, dirs, **) is reused verbatim by BOTH `git add -A` (push) and
+//    `git check-ignore` (detection) — no hand-rolled matcher to drift.
+//    Shape filters (which files a group syncs at all) stay in syncSpec; this
+//    is an ADDITIONAL layer for "don't ship these".
+const IGNORE_FILE = '.gitignore'
+
+const DEFAULT_IGNORE = [
+  '# dsh-sync 忽略清单（本机维护、不同步）。语法与 gitignore 完全一致：',
+  '#   模式行 / 目录想/ / ** / 用 ! 反转。',
+  '# 插件已内置排除、无需重复：__pycache__/、*.pyc、node_modules/、',
+  '#   .dsh-market/、cordis.yml、.git、插件组的 package-lock.json 等。',
+  '# 这里写你额外不想同步的内容（编辑器临时文件、大文件、特定 skill 等），例如：',
+  '#   *.tmp',
+  '#   .DS_Store',
+  '#   skills/agents/某个不想同步的技能/',
+  '',
+  '.DS_Store',
+  'Thumbs.db',
+  '*.swp',
+  '*.swo',
+  '*~',
+  '',
+].join('\n')
+
+function ignoreFile() { return join(dshHome(), 'dsh-sync', IGNORE_FILE) }
+
+/** Ensure the per-machine ignore file exists (written once; user edits freely). */
+async function ensureIgnoreFile() {
+  const file = ignoreFile()
+  try { await fsP.access(file); return file } catch {}
+  await fsP.mkdir(join(file, '..'), { recursive: true })
+  try { await atomicWriteFile(file, DEFAULT_IGNORE) } catch {}
+  return file
+}
+
+/** Point the shadow repo's local config at the ignore file, so every git
+ *  command in it (add / status / check-ignore) honors it without threading
+ *  `-c` per call. Set right after a clone / on first use; git re-reads the
+ *  file live, so later edits take effect on the next command. */
+async function configureIgnore(binary, repoDir) {
+  const file = await ensureIgnoreFile()
+  try { await gitExec(binary, ['config', 'core.excludesFile', file], repoDir) } catch {}
+  return file
+}
+
+/** Which shadow-relative paths are ignored? One `git check-ignore --stdin`
+ *  call over the whole path list (56ms @13k paths). Exit 1 = none ignored → ∅. */
+function collectIgnored(binary, repoDir, shadowRels) {
+  if (!shadowRels || shadowRels.length === 0) return Promise.resolve(new Set())
+  return new Promise((fulfil) => {
+    const child = execFile(binary, ['check-ignore', '--stdin'], { cwd: repoDir, maxBuffer: 32 * 1024 * 1024 }, (error, stdout) => {
+      // non-zero exit (1) = no patterns matched → treat as "nothing ignored"
+      if (error) { fulfil(new Set()); return }
+      fulfil(new Set(String(stdout).split(/\r?\n/).filter(Boolean)))
+    })
+    child.stdin.on('error', () => {})
+    child.stdin.write(shadowRels.join('\n') + '\n')
+    child.stdin.end()
+  })
 }
 
 // ── Shared helpers (ported from skills-management so conventions match) ──
@@ -247,9 +322,11 @@ function syncSpec(eff, roots = defaultRoots()) {
   if (eff.syncSkills) groups.push({
     name: 'skills',
     sources: [
-      { from: roots.dshSkills, to: 'skills/dsh' },
+      // __pycache__ = 机器相关字节码缓存（cpython-312/314 各不相同），
+      // 同步只会制造永恒的假变更与冲突——一律排除
+      { from: roots.dshSkills, to: 'skills/dsh', excludeDirs: new Set(['__pycache__']) },
       // 软链解引用成实文件：跨机不能指望同一个 link target 存在
-      { from: roots.agentsSkills, to: 'skills/agents', followSymlinks: true },
+      { from: roots.agentsSkills, to: 'skills/agents', followSymlinks: true, excludeDirs: new Set(['__pycache__']) },
       { from: roots.agentsLock, to: 'skills/.skill-lock.json', file: true },
     ],
   })
@@ -276,16 +353,18 @@ function syncSpec(eff, roots = defaultRoots()) {
   return groups
 }
 
-async function copyTree(from, to, opts) {
-  const { includeFiles, excludeDirs, excludeNames, followSymlinks } = opts || {}
+async function copyTree(from, to, opts, relBase = '') {
+  const { includeFiles, excludeDirs, excludeNames, followSymlinks, ignored } = opts || {}
   await fsP.mkdir(to, { recursive: true })
   let entries
   try { entries = await fsP.readdir(from, { withFileTypes: true }) } catch { return }
   for (const ent of entries) {
     if (ent.name === '.git') continue
+    const rel = relBase ? `${relBase}/${ent.name}` : ent.name
+    if (ignored && ignored.has(rel)) continue                    // .gitignore → skip
     if (ent.isDirectory()) {
       if (excludeDirs && excludeDirs.has(ent.name)) continue
-      await copyTree(join(from, ent.name), join(to, ent.name), opts)
+      await copyTree(join(from, ent.name), join(to, ent.name), opts, rel)
     } else {
       if (excludeNames && excludeNames.has(ent.name)) continue
       if (includeFiles && !includeFiles.has(ent.name)) continue
@@ -297,12 +376,18 @@ async function copyTree(from, to, opts) {
   }
 }
 
-/** Push a live snapshot into the shadow tree (shadow = live after this). */
-async function mirrorLiveToShadow(spec, shadowDir) {
+/** Push a live snapshot into the shadow tree (shadow = live after this).
+ *  `opts.ignored` (Set of shadow-relative paths) makes blocked files invisible:
+ *  they are not copied, and — because mirrorLiveToShadow rm -rf's each group
+ *  target first — files the baseline still carries get removed from the
+ *  worktree, so `git add -A` records their deletion and the next push drops
+ *  them from the remote (one-time cleanup once a path is ignored). */
+async function mirrorLiveToShadow(spec, shadowDir, { ignored } = {}) {
   for (const group of spec) {
     for (const src of group.sources) {
       const target = join(shadowDir, src.to)
       if (src.file) {
+        if (ignored && ignored.has(src.to.split(sep).join('/'))) continue
         try {
           await fsP.access(src.from)
           await fsP.mkdir(join(target, '..'), { recursive: true })
@@ -315,7 +400,8 @@ async function mirrorLiveToShadow(spec, shadowDir) {
           excludeDirs: src.excludeDirs,
           excludeNames: src.excludeNames,
           followSymlinks: src.followSymlinks,
-        })
+          ignored,
+        }, src.to.split(sep).join('/'))
       }
     }
   }
@@ -337,6 +423,209 @@ function resolveLivePath(spec, shadowRel) {
     }
   }
   return undefined
+}
+
+// ── Update detection: local pending changes + remote updates ──
+//    git-style change awareness between full sync cycles:
+//    · local  — stat-only fingerprint walk gates a content-level classify that
+//               hashes live files (`git hash-object --stdin-paths`, one
+//               process, read-only, never touches the shadow worktree) and
+//               diffs them against `git ls-tree <lastSyncedCommit>`;
+//    · remote — fetch + `rev-list --count`/`diff --name-status` against the
+//               last synced baseline, so another machine's push shows up as
+//               "N new commits / M files" instead of silence.
+
+/** Stat-only walk of the live roots per spec → Map<shadowRel, {live, mtimeMs, size}>.
+ *  Mirrors copyTree's filtering exactly (includeFiles/excludeDirs/excludeNames,
+ *  followSymlinks) so the fingerprint covers precisely what sync would mirror. */
+async function walkLiveFingerprint(spec) {
+  const fp = new Map()
+  const walk = async (from, rel, opts) => {
+    let entries
+    try { entries = await fsP.readdir(from, { withFileTypes: true }) } catch { return }
+    for (const ent of entries) {
+      if (ent.name === '.git') continue
+      const p = join(from, ent.name)
+      const r = rel ? rel + '/' + ent.name : ent.name
+      if (ent.isDirectory()) {
+        if (opts.excludeDirs && opts.excludeDirs.has(ent.name)) continue
+        await walk(p, r, opts)
+      } else {
+        if (opts.excludeNames && opts.excludeNames.has(ent.name)) continue
+        if (opts.includeFiles && !opts.includeFiles.has(ent.name)) continue
+        let st
+        try {
+          if (ent.isSymbolicLink()) {
+            // non-follow groups skip symlinks exactly like copyTree does
+            if (!opts.followSymlinks) continue
+            st = await fsP.stat(p)
+          } else if (ent.isFile()) {
+            st = await fsP.stat(p)
+          } else continue
+        } catch { continue }
+        if (st.isFile()) fp.set(r, { live: p, mtimeMs: st.mtimeMs, size: st.size })
+      }
+    }
+  }
+  for (const group of spec) {
+    for (const src of group.sources) {
+      const to = src.to.split(sep).join('/')
+      if (src.file) {
+        try {
+          const st = await fsP.stat(src.from)
+          if (st.isFile()) fp.set(to, { live: src.from, mtimeMs: st.mtimeMs, size: st.size })
+        } catch {}
+      } else {
+        await walk(src.from, to, {
+          includeFiles: src.includeFiles,
+          excludeDirs: src.excludeDirs,
+          excludeNames: src.excludeNames,
+          followSymlinks: src.followSymlinks,
+        })
+      }
+    }
+  }
+  return fp
+}
+
+function fingerprintEqual(a, b) {
+  if (a === b) return true
+  if (!a || !b || a.size !== b.size) return false
+  for (const [k, v] of a) {
+    const w = b.get(k)
+    if (!w || w.mtimeMs !== v.mtimeMs || w.size !== v.size) return false
+  }
+  return true
+}
+
+/** Hash live files in ONE git process (`--stdin-paths`, no -w → nothing is
+ *  written to the object db). Returns hashes in input order. Paths containing
+ *  newlines break the stdin protocol — callers keep them out and treat those
+ *  files via fingerprint only. */
+function gitHashObjectStdin(binary, paths, cwd) {
+  return new Promise((fulfil, reject) => {
+    const child = execFile(binary, ['hash-object', '--stdin-paths'], { cwd, maxBuffer: 32 * 1024 * 1024 }, (error, stdout) => {
+      if (error) { reject(new Error(`git hash-object: ${String(error.message || '').slice(-160)}`)); return }
+      fulfil(String(stdout).split(/\r?\n/).filter(Boolean))
+    })
+    // one write + EOF; git hashes in order, output lines match input order
+    child.stdin.on('error', () => {})   // EPIPE if git dies early — callback above reports it
+    child.stdin.write(paths.join('\n') + '\n')
+    child.stdin.end()
+  })
+}
+
+/** `git ls-tree -r -z <commit>` → Map<path, blobHash>. -z = NUL-terminated
+ *  raw paths (no quoting), parsed as Buffer so unicode survives. */
+function gitLsTree(binary, commit, cwd) {
+  return new Promise((fulfil, reject) => {
+    execFile(binary, ['ls-tree', '-r', '-z', commit], { cwd, maxBuffer: 64 * 1024 * 1024, encoding: 'buffer' }, (error, stdout) => {
+      if (error) { reject(new Error(`git ls-tree: ${String(error.message || '').slice(-160)}`)); return }
+      const map = new Map()
+      for (const rec of stdout.toString('utf8').split('\0')) {
+        if (!rec) continue
+        const tab = rec.indexOf('\t')
+        if (tab < 0) continue
+        const hash = rec.slice(0, tab).split(' ')[2]
+        if (hash) map.set(rec.slice(tab + 1), hash)
+      }
+      fulfil(map)
+    })
+  })
+}
+
+/** Classify live-vs-baseline differences (git-status style A/M/D).
+ *  Pure & read-only: safe to run concurrently with a sync run. Pass a
+ *  precomputed `fingerprint` to skip the internal walk, and `ignored` (a Set
+ *  of shadow-relative paths from .gitignore) to leave ignored files invisible
+ *  — they never appear as A/M/D and are not "deleted" when the baseline still
+ *  carried them (the push removes them from the remote silently instead). */
+async function classifyLocalChanges(binary, eff, { repoDir, state, roots, fingerprint, ignored } = {}) {
+  if (!state || !state.lastSyncedCommit) return { disabled: 'no-baseline' }
+  const spec = syncSpec(eff, roots)
+  if (spec.length === 0) return { disabled: 'no-groups' }
+  const fp = fingerprint || await walkLiveFingerprint(spec)
+  const ignoredSet = ignored instanceof Set ? ignored : new Set()
+  // drop ignored live entries so they are invisible to the diff (and to the
+  // fingerprint gate that produced this map)
+  for (const rel of ignoredSet) fp.delete(rel)
+  // baseline tree, restricted to active spec prefixes via resolveLivePath
+  const baseline = await gitLsTree(binary, state.lastSyncedCommit, repoDir)
+  // live content hashes (single process); newline paths fall back to fingerprint
+  const liveEntries = [...fp.entries()]
+  const hashable = liveEntries.filter(([, v]) => !v.live.includes('\n'))
+  let hashes = []
+  if (hashable.length > 0) {
+    hashes = await gitHashObjectStdin(binary, hashable.map(([, v]) => v.live), repoDir)
+  }
+  const files = []
+  let added = 0, modified = 0, deleted = 0
+  hashable.forEach(([rel], i) => {
+    const base = baseline.get(rel)
+    const h = hashes[i]
+    if (base === undefined) { files.push({ path: rel, kind: 'A' }); added++ }
+    else if (h !== base) { files.push({ path: rel, kind: 'M' }); modified++ }
+  })
+  for (const [rel, v] of liveEntries) {
+    if (!v.live.includes('\n')) continue
+    if (baseline.get(rel) === undefined) { files.push({ path: rel, kind: 'A' }); added++ }
+    else { files.push({ path: rel, kind: 'M' }); modified++ }   // hash unknown → fingerprint said changed
+  }
+  for (const rel of baseline.keys()) {
+    if (ignoredSet.has(rel)) continue                            // ignored → invisible, not "deleted"
+    if (resolveLivePath(spec, rel) === undefined) continue       // outside active groups (incl. .gitattributes)
+    if (!fp.has(rel)) { files.push({ path: rel, kind: 'D' }); deleted++ }
+  }
+  files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
+  return { dirty: files.length > 0, files, counts: { added, modified, deleted }, trackedFiles: fp.size }
+}
+
+/** Fetch and measure how far the remote moved past our baseline. Pure core
+ *  (no lock/cache); the apply() wrapper holds the cross-process lock because
+ *  fetch rewrites FETCH_HEAD, which sync runs also use. */
+async function checkRemoteUpdates(binary, eff, { repoDir, state } = {}) {
+  if (!state || !state.lastSyncedCommit) return { disabled: 'no-baseline' }
+  // baseline must exist in the local odb (a force-pushed remote can drop it)
+  const baseKnown = await gitExec(binary, ['rev-parse', '--verify', `${state.lastSyncedCommit}^{commit}`], repoDir).then(() => true).catch(() => false)
+  if (!baseKnown) return { disabled: 'baseline-lost' }
+  const remote = authedUrl(eff.repoUrl, eff.token)
+  try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir) }
+  catch (e) {
+    if (/Could not find|doesn't exist|no such|empty/i.test(String(e && e.message))) return { behind: 0, empty: true }
+    throw e
+  }
+  const head = (await gitExec(binary, ['rev-parse', 'FETCH_HEAD'], repoDir).catch(() => '')).trim()
+  if (!head) return { behind: 0, empty: true }
+  if (head === state.lastSyncedCommit) return { behind: 0, head }
+  let behind = parseInt((await gitExec(binary, ['rev-list', '--count', `${state.lastSyncedCommit}..FETCH_HEAD`], repoDir).catch(() => '0')).trim(), 10) || 0
+  const files = []
+  try {
+    const raw = await gitExec(binary, ['diff', '--name-status', state.lastSyncedCommit, 'FETCH_HEAD'], repoDir)
+    for (const line of raw.split(/\r?\n/)) {
+      const m = line.match(/^([AMDR])\d*\t(.+)$/)
+      if (m) files.push({ path: m[2], kind: m[1] === 'R' ? 'M' : m[1] })
+    }
+  } catch {}
+  const commits = []
+  try {
+    const raw = await gitExec(binary, ['log', `--format=%h%x09%an%x09%aI%x09%s`, '-n', String(CHECK_COMMITS_CAP), `${state.lastSyncedCommit}..FETCH_HEAD`], repoDir)
+    for (const line of raw.split(/\r?\n/).filter(Boolean)) {
+      const parts = line.split('\t')
+      if (parts.length >= 4) commits.push({ hash: parts[0], author: parts[1], at: parts[2], subject: parts.slice(3).join('\t') })
+    }
+  } catch {}
+  return { behind, head, files, commits }
+}
+
+/** Trim a check result for the status payload (caps + no unbounded lists). */
+function trimCheck(check) {
+  if (!check) return null
+  const out = { ...check }
+  if (Array.isArray(out.files) && out.files.length > CHECK_FILE_LIST_CAP) {
+    out.filesTotal = out.files.length
+    out.files = out.files.slice(0, CHECK_FILE_LIST_CAP)
+  }
+  return out
 }
 
 // ── Shadow repo lifecycle ──
@@ -370,6 +659,10 @@ async function ensureShadowRepo(binary, eff, repoDir) {
 async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots }) {
   const remote = await ensureShadowRepo(binary, eff, repoDir)
   const spec = syncSpec(eff, roots)
+  // per-machine .gitignore → shadow repo core.excludesFile; collect the
+  // ignored shadow-relative paths so mirror stops stuffing them into the tree
+  await configureIgnore(binary, repoDir)
+  const ignored = await collectIgnored(binary, repoDir, [...(await walkLiveFingerprint(spec)).keys()])
 
   // 1. fetch origin/main → FETCH_HEAD (canonical baseline)
   try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
@@ -384,7 +677,7 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots 
   // detach onto base so the working tree reflects the canonical baseline
   await gitExec(binary, ['checkout', '--detach', baseRef], repoDir).catch(() => {})
   // 3. overlay live snapshot onto the baseline: shadow now = baseline + local deltas
-  await mirrorLiveToShadow(spec, repoDir)
+  await mirrorLiveToShadow(spec, repoDir, { ignored })
 
   // 4. commit on a fresh branch
   await gitExec(binary, ['checkout', '-b', branch], repoDir)
@@ -726,7 +1019,7 @@ function createAgentRunJob({ prompt, dir, jobs, logger, sessions, token }) {
 module.exports = {
   name: 'dsh-sync',
   inject: ['webServer', 'settings'],
-  __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, substituteParams },
+  __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, substituteParams, walkLiveFingerprint, fingerprintEqual, classifyLocalChanges, checkRemoteUpdates, gitLsTree, gitHashObjectStdin, trimCheck, ignoreFile, ensureIgnoreFile, configureIgnore, collectIgnored, DEFAULT_IGNORE },
 
   apply(ctx, config = {}) {
     const dh = dshHome()
@@ -761,6 +1054,8 @@ module.exports = {
           syncSessions: Schema.boolean(),
           syncSettings: Schema.boolean(),
           syncPlugins: Schema.boolean(),
+          checkIntervalMinutes: Schema.number(),
+          watchLocalChanges: Schema.boolean(),
           token: Schema.string(),
         }), { base: baseSettings() })
       } catch (e) { ctx.logger.warn(`dsh-sync: settings register: ${e && e.message}`) }
@@ -816,7 +1111,121 @@ module.exports = {
         } finally { release() }
         return result
       })().finally(() => { syncRun = null })
+      // sync moved both sides — refresh detection shortly after so the badges
+      // clear (lock is released by then; checks re-acquire it on their own)
+      const refreshTimer = setTimeout(() => {
+        runLocalCheck(true).catch(() => {})
+        runRemoteCheck().catch(() => {})
+      }, 500)
+      if (typeof refreshTimer.unref === 'function') refreshTimer.unref()
       return syncRun
+    }
+
+    // ── Update detection runtime ──
+    //    Results are cached in memory (+ small summaries in state.json so the
+    //    UI is warm right after a restart). Request paths NEVER await a check
+    //    — they read the cache and, when stale, kick a background single-flight
+    //    refresh after the response goes out.
+    let localCheck = null        // { at, dirty, files, counts, trackedFiles | disabled | error }
+    let remoteCheck = null       // { at, behind, files, commits, head | disabled | error | empty }
+    let localFingerprint = null  // Map from the last deep classify — the cheap gate
+    let localChecking = null     // in-flight single-flight promises
+    let remoteChecking = null
+    let watchers = []
+    let watchDebounce = null
+
+    const checkTtlMs = () => Math.max(1, syncSettings().checkIntervalMinutes || 5) * 60 * 1000
+
+    const runLocalCheck = async (force = false) => {
+      if (localChecking) return localChecking
+      localChecking = (async () => {
+        await stateLoaded
+        const eff = syncSettings()
+        const repoExists = await fsP.access(join(repoDir, '.git')).then(() => true).catch(() => false)
+        if (!repoExists) { localCheck = { at: new Date().toISOString(), disabled: 'no-repo' }; return localCheck }
+        try {
+          // .gitignore as core.excludesFile → collect the ignored paths once
+          await configureIgnore(eff.gitBinary, repoDir)
+          const all = await walkLiveFingerprint(syncSpec(eff))
+          const ignored = await collectIgnored(eff.gitBinary, repoDir, [...all.keys()])
+          // fingerprint gate: skip the deep (content-hash) classify when
+          // nothing moved since the last one — unless forced. Ignored paths
+          // are filtered out so ignored-file churn never triggers a re-hash.
+          const fp = new Map([...all].filter(([rel]) => !ignored.has(rel)))
+          if (!force && localCheck && !localCheck.disabled && !localCheck.error
+              && localFingerprint && fingerprintEqual(fp, localFingerprint)) {
+            localCheck = { ...localCheck, at: new Date().toISOString() }
+            return localCheck
+          }
+          const res = await classifyLocalChanges(eff.gitBinary, eff, { repoDir, state, fingerprint: fp, ignored })
+          localFingerprint = res.disabled ? null : fp
+          localCheck = { at: new Date().toISOString(), ...res }
+          state.lastLocalCheck = { at: localCheck.at, dirty: !!res.dirty, counts: res.counts, disabled: res.disabled }
+          await saveState()
+          return localCheck
+        } catch (e) {
+          localCheck = { at: new Date().toISOString(), error: String(e && e.message || e) }
+          return localCheck
+        }
+      })().finally(() => { localChecking = null })
+      return localChecking
+    }
+
+    const runRemoteCheck = async (force = false) => {
+      if (remoteChecking) return remoteChecking
+      remoteChecking = (async () => {
+        await stateLoaded
+        const eff = syncSettings()
+        const at = () => new Date().toISOString()
+        if (!eff.repoUrl || !eff.token) { remoteCheck = { at: at(), disabled: 'not-configured' }; return remoteCheck }
+        const repoExists = await fsP.access(join(repoDir, '.git')).then(() => true).catch(() => false)
+        if (!repoExists) { remoteCheck = { at: at(), disabled: 'no-repo' }; return remoteCheck }
+        if (syncRun !== null) return remoteCheck || { at: at(), skipped: 'sync-busy' }
+        // fetch rewrites FETCH_HEAD — take the same lock sync runs hold
+        const release = await acquireLock(lockFile)
+        if (release === null) return remoteCheck || { at: at(), skipped: 'lock-busy' }
+        try {
+          const res = await checkRemoteUpdates(eff.gitBinary, eff, { repoDir, state })
+          remoteCheck = { at: at(), ...res }
+          state.lastRemoteCheck = { at: remoteCheck.at, behind: res.behind || 0, disabled: res.disabled }
+          await saveState()
+          return remoteCheck
+        } catch (e) {
+          remoteCheck = { at: at(), error: String(e && e.message || e) }
+          return remoteCheck
+        } finally { release() }
+      })().finally(() => { remoteChecking = null })
+      return remoteChecking
+    }
+
+    // fs.watch gives "file changed → notice in seconds" instead of waiting for
+    // the next interval. recursive watch on the group roots; a file source's
+    // PARENT is watched non-recursively (watching ~/.dsh recursively would
+    // cover sessions + the shadow repo and self-trigger on every sync write).
+    const setupWatchers = () => {
+      for (const w of watchers) { try { w.close() } catch {} }
+      watchers = []
+      let eff
+      try { eff = syncSettings() } catch { return }
+      if (!eff.watchLocalChanges) return
+      const poke = () => {
+        if (watchDebounce) return
+        watchDebounce = setTimeout(() => { watchDebounce = null; runLocalCheck().catch(() => {}) }, WATCH_DEBOUNCE_MS)
+        if (typeof watchDebounce.unref === 'function') watchDebounce.unref()
+      }
+      const watch = (dir, recursive) => {
+        try {
+          const w = fsSync.watch(dir, { recursive }, poke)
+          w.on('error', () => { try { w.close() } catch {} })
+          watchers.push(w)
+        } catch (e) { ctx.logger.warn(`dsh-sync: watch ${dir}: ${e && e.message}`) }
+      }
+      for (const group of syncSpec(eff)) {
+        for (const src of group.sources) {
+          if (src.file) watch(join(src.from, '..'), false)
+          else watch(src.from, true)
+        }
+      }
     }
 
     // ── Agent-run jobs (action buttons → apiproxy 主对话级 session) ──
@@ -833,7 +1242,7 @@ module.exports = {
       }
     } catch {}
 
-    // ── Startup + periodic auto-sync ──
+    // ── Startup + periodic auto-sync + update detection loop ──
     ctx.effect(() => {
       const fireIfDue = async (reason) => {
         await stateLoaded
@@ -845,7 +1254,25 @@ module.exports = {
       fireIfDue('startup')
       const timer = setInterval(() => fireIfDue('interval'), Math.max(5, (syncSettings().intervalMinutes || 30)) * 60 * 1000)
       if (typeof timer.unref === 'function') timer.unref()
-      return () => clearInterval(timer)
+      // detection runs on its own (shorter) cadence and does NOT depend on
+      // autoSync — manual-sync users still want change awareness
+      const fireChecks = (reason) => {
+        runRemoteCheck().catch(e => ctx.logger.warn(`dsh-sync: ${reason} remote check: ${e && e.message}`))
+        runLocalCheck().catch(e => ctx.logger.warn(`dsh-sync: ${reason} local check: ${e && e.message}`))
+      }
+      const first = setTimeout(() => fireChecks('startup'), 15 * 1000)
+      if (typeof first.unref === 'function') first.unref()
+      const checkTimer = setInterval(() => fireChecks('interval'), Math.max(1, (syncSettings().checkIntervalMinutes || 5)) * 60 * 1000)
+      if (typeof checkTimer.unref === 'function') checkTimer.unref()
+      setupWatchers()
+      return () => {
+        clearInterval(timer)
+        clearInterval(checkTimer)
+        clearTimeout(first)
+        if (watchDebounce) { clearTimeout(watchDebounce); watchDebounce = null }
+        for (const w of watchers) { try { w.close() } catch {} }
+        watchers = []
+      }
     }, 'dsh-sync: auto-sync')
 
     // ── HTTP API ──
@@ -866,6 +1293,7 @@ module.exports = {
             const repoExists = await fsP.access(join(repoDir, '.git')).then(() => true).catch(() => false)
             sendJson(res, 200, {
               repoUrl: eff.repoUrl, branch: eff.branch, dir: displayPath(repoDir), repoExists,
+              ignoreFile: displayPath(ignoreFile()),
               instanceId: state.instanceId,
               gitAvailable: await gitAvailable(eff.gitBinary),
               lastSyncAt: state.lastSyncAt, lastResult: state.lastResult,
@@ -873,11 +1301,62 @@ module.exports = {
               intervalMinutes: eff.intervalMinutes, conflictMode: eff.conflictMode,
               syncSkills: eff.syncSkills, syncSessions: eff.syncSessions,
               syncSettings: eff.syncSettings, syncPlugins: eff.syncPlugins,
+              checkIntervalMinutes: eff.checkIntervalMinutes,
+              watchLocalChanges: eff.watchLocalChanges,
               hasToken: typeof token === 'string' && token !== '',
               syncing: syncRun !== null,
+              // update detection: cached results only — never awaited here
+              localCheck: trimCheck(localCheck) || state.lastLocalCheck || null,
+              remoteCheck: trimCheck(remoteCheck) || state.lastRemoteCheck || null,
+              checking: { local: localChecking !== null, remote: remoteChecking !== null },
               pendingConflict: state.lastResult && state.lastResult.push && state.lastResult.push.conflict === true
                 ? { branch: state.lastPushedBranch, prNumber: state.lastPrNumber } : null,
             })
+            // stale-while-revalidate: refresh in the background AFTER the
+            // response is on its way (never block the request path)
+            const ttl = checkTtlMs()
+            const stale = (c) => !c || !c.at || Date.now() - new Date(c.at).getTime() > ttl
+            const wantLocal = stale(localCheck) && repoExists
+            const wantRemote = stale(remoteCheck) && repoExists && !!eff.repoUrl && !!token
+            if (wantLocal || wantRemote) {
+              setImmediate(() => {
+                if (wantLocal) runLocalCheck().catch(() => {})
+                if (wantRemote) runRemoteCheck().catch(() => {})
+              })
+            }
+            return
+          }
+
+          // POST /dsh-sync/api/check {local?, remote?} → run checks now
+          if (req.method === 'POST' && apiPath.endsWith('/dsh-sync/api/check')) {
+            const body = await readJsonBody(req)
+            const jobs = []
+            if (body.local !== false) jobs.push(runLocalCheck(true).catch(e => ({ error: String(e && e.message || e) })))
+            if (body.remote !== false) jobs.push(runRemoteCheck(true).catch(e => ({ error: String(e && e.message || e) })))
+            await Promise.all(jobs)
+            sendJson(res, 200, { localCheck: trimCheck(localCheck), remoteCheck: trimCheck(remoteCheck) })
+            return
+          }
+
+          // GET /dsh-sync/api/ignore → the per-machine ignore file (create if missing)
+          if (req.method === 'GET' && apiPath.endsWith('/dsh-sync/api/ignore')) {
+            const file = await ensureIgnoreFile()
+            const content = await fsP.readFile(file, 'utf8').catch(() => '')
+            sendJson(res, 200, { path: displayPath(file), content, default: DEFAULT_IGNORE })
+            return
+          }
+
+          // PUT /dsh-sync/api/ignore {content} → write the file, refresh detection
+          if (req.method === 'PUT' && apiPath.endsWith('/dsh-sync/api/ignore')) {
+            const body = await readJsonBody(req)
+            if (typeof body.content !== 'string') { sendJson(res, 400, { error: 'content 必须是字符串' }); return }
+            if (Buffer.byteLength(body.content, 'utf8') > 256 * 1024) { sendJson(res, 400, { error: '忽略清单过大（>256KB）' }); return }
+            const file = await ensureIgnoreFile()
+            await atomicWriteFile(file, body.content)
+            // content read live by git on the next command; refresh detection so
+            // the status card reflects the change without waiting an interval
+            setImmediate(() => { runLocalCheck(true).catch(() => {}) })
+            sendJson(res, 200, { path: displayPath(file), content: body.content, ok: true })
             return
           }
 
@@ -898,10 +1377,11 @@ module.exports = {
             for (const key of ['repoUrl', 'branch', 'gitBinary', 'conflictMode']) {
               if (typeof body[key] === 'string' && body[key] !== '') patch[key] = body[key]
             }
-            for (const key of ['autoSync', 'syncOnStartup', 'syncSkills', 'syncSessions', 'syncSettings', 'syncPlugins']) {
+            for (const key of ['autoSync', 'syncOnStartup', 'syncSkills', 'syncSessions', 'syncSettings', 'syncPlugins', 'watchLocalChanges']) {
               if (typeof body[key] === 'boolean') patch[key] = body[key]
             }
             if (typeof body.intervalMinutes === 'number' && body.intervalMinutes >= 1) patch.intervalMinutes = body.intervalMinutes
+            if (typeof body.checkIntervalMinutes === 'number' && body.checkIntervalMinutes >= 1) patch.checkIntervalMinutes = body.checkIntervalMinutes
             // token: non-empty sets; null/'' clears. Never echoed.
             if (typeof body.token === 'string' && body.token !== '') patch.token = body.token
             if (body.token === null || body.token === '') patch.token = undefined
@@ -913,6 +1393,10 @@ module.exports = {
             }
             if (settingsScope && typeof settingsScope.update === 'function') await settingsScope.update(patch)
             else Object.assign(settingsOverrides, patch)
+            // group toggles / watch switch change what the watchers cover
+            if ('watchLocalChanges' in patch || 'syncSkills' in patch || 'syncSessions' in patch || 'syncSettings' in patch || 'syncPlugins' in patch) {
+              setupWatchers()
+            }
             const eff = syncSettings()
             const { token, ...safe } = eff
             sendJson(res, 200, { settings: safe, hasToken: typeof token === 'string' && token !== '' })
