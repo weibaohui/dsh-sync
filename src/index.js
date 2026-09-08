@@ -1063,11 +1063,16 @@ module.exports = {
         onFinish: () => {
           alignState.active = false
           // 对齐成功 → 销账（本机版本已是语义合并结果，随下一次推送传播）+ 补一次
-          // 确定性同步把它推上去；失败则保留挂账，文件继续被 preserve 保护
+          // 确定性同步把它推上去；失败则保留挂账，文件继续被 preserve 保护。
+          // 延迟 + 锁重试：agent 自己最后一步 curl 的同步可能还持着锁
           if (job.code === 0 && both.length > 0) {
             for (const f of both) delete state.pendingBoth[f.shadowPath]
             saveState()
-            runSync({ autoAlign: false }).catch(e => ctx.logger.warn(`dsh-sync: post-align sync: ${e && e.message}`))
+            const post = (n) => runSync({ autoAlign: false }).catch(e => {
+              if (/另一个同步进程/.test(String(e && e.message)) && n < 4) setTimeout(() => post(n + 1), 5000)
+              else ctx.logger.warn(`dsh-sync: post-align sync: ${e && e.message}`)
+            })
+            setTimeout(() => post(0), 3000)
           }
         },
       })
