@@ -104,7 +104,12 @@ window.__ModuleLoader__.load({
       toggleSessions: '会话 sessions',
       toggleSettings: '设置 settings',
       togglePlugins: '插件 plugins',
-      groupHint: '勾选要同步的类别（取消勾选不同步），首次开启会全量上传',
+      groupHint: '勾选要同步的类别，再为每类选策略',
+      strategyBackup: '备份 · 各机独立',
+      strategyUnion: '并集 · 冲突交 AI',
+      strategyRemote: '覆盖 · 远端为准',
+      strategyLocal: '覆盖 · 本地为准',
+      strategyHint: '备份=云上各存各的（backup/实例ID/），本地永不被覆盖；并集=新增都收、双方改动交 AI；远端为准=本地只读镜像；本地为准=只推不拉',
       conflictTitle: '解决同步冲突',
       conflictHint: '检测到未合并的同步 PR（两台机器改了同一文件）。点击下方按钮，AI 会读取本机令牌、分析两边改动、解决冲突并合并 PR。',
       conflictPending: '有未解决的冲突 PR',
@@ -156,7 +161,12 @@ window.__ModuleLoader__.load({
       toggleSessions: 'Sessions',
       toggleSettings: 'Settings',
       togglePlugins: 'Plugins',
-      groupHint: 'Toggle categories to sync (off = skipped); first enable uploads the full set',
+      groupHint: 'Toggle a category, then pick its strategy',
+      strategyBackup: 'Backup · per-machine',
+      strategyUnion: 'Union · AI resolves',
+      strategyRemote: 'Overwrite · remote wins',
+      strategyLocal: 'Overwrite · local wins',
+      strategyHint: 'Backup = each machine stores its own (backup/<id>/), local never overwritten; Union = collect all adds, both-side edits go to AI; remote wins = local read-only mirror; local wins = push-only',
       conflictTitle: 'Resolve sync conflict',
       conflictHint: 'An unmerged sync PR exists (two machines edited the same file). Click below: the AI reads the local token, analyzes both sides, resolves the conflict and merges the PR.',
       conflictPending: 'Unresolved conflict PR',
@@ -217,7 +227,10 @@ window.__ModuleLoader__.load({
     .sk-tag.danger{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}
     .sk-card{display:flex;flex-direction:column;gap:10px;padding:16px;border-radius:12px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1)}
     .sk-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-    .sk-toggles{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}
+    .sk-toggles{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}
+    .sk-gcard{display:flex;flex-direction:column;gap:7px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;background:var(--dsw-alias-bg-layer-1)}
+    .sk-gcard.on{border-color:var(--dsw-alias-state-business-primary)}
+    .sk-select{min-height:30px;width:100%;font-size:12.5px;padding:4px 8px}
     .sk-toggle{display:flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font-size:13px;cursor:pointer}
     .sk-toggle.on{border-color:var(--dsw-alias-state-business-primary);color:var(--dsw-alias-state-business-primary);background:var(--dsw-alias-interactive-bg-hover)}
     .sk-spin{width:22px;height:22px;border-radius:50%;border:3px solid var(--dsw-alias-border-l2);border-top-color:var(--dsw-alias-brand-primary,var(--dsw-alias-state-business-primary));animation:dshspin .7s linear infinite}
@@ -356,6 +369,7 @@ window.__ModuleLoader__.load({
       const [syncOnStartup, setSyncOnStartup] = useState(false)
       const [conflictMode, setConflictMode] = useState('ai')
       const [g, setG] = useState({ skills: true, sessions: false, settings: true, plugins: true })
+      const [gs, setGs] = useState({ skills: 'union', sessions: 'backup', settings: 'backup', plugins: 'backup' })
 
       const onToast = (text, ms = 3000) => { setToastText(text); setTimeout(() => setToastText(null), ms) }
       const refresh = () => getJson(API + '/status').then(d => {
@@ -367,6 +381,7 @@ window.__ModuleLoader__.load({
         setSyncOnStartup(d.syncOnStartup)
         setConflictMode(d.conflictMode)
         setG({ skills: d.syncSkills, sessions: d.syncSessions, settings: d.syncSettings, plugins: d.syncPlugins })
+        if (d.strategies) setGs(d.strategies)
       }).catch(() => {})
       useEffect(() => {
         refresh()
@@ -407,7 +422,7 @@ window.__ModuleLoader__.load({
       }
       const doSave = async () => {
         try {
-          const patch = { repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode, syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins }
+          const patch = { repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode, syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins, skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins }
           if (token !== '') patch.token = token
           await putSettings(patch)
           setToken('')
@@ -424,8 +439,14 @@ window.__ModuleLoader__.load({
       try {
         const row = (label, value) => h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 12, padding: '3px 0' } },
           h('span', { className: 'sk-dir' }, label), h('span', { className: 'sk-hint', style: { wordBreak: 'break-all', textAlign: 'right' } }, value))
-        const toggle = (key, label) => h('label', { key, className: 'sk-toggle' + (g[key] ? ' on' : '') },
-          h('input', { type: 'checkbox', checked: g[key], onChange: e => setG(prev => ({ ...prev, [key]: e.target.checked })) }), label)
+        const STRATS = ['backup', 'union', 'remote', 'local']
+        const cap = (v) => v[0].toUpperCase() + v.slice(1)
+        const groupCard = (key, label) => h('div', { key, className: 'sk-gcard' + (g[key] ? ' on' : '') },
+          h('label', { className: 'sk-toggle' + (g[key] ? ' on' : ''), style: { border: 'none', background: 'transparent', padding: 0, cursor: 'pointer' } },
+            h('input', { type: 'checkbox', checked: g[key], onChange: e => setG(prev => ({ ...prev, [key]: e.target.checked })) }), label),
+          g[key] && h('select', { className: 'sk-input sk-select', value: gs[key] || 'backup',
+            onChange: e => setGs(prev => ({ ...prev, [key]: e.target.value })) },
+            STRATS.map(v => h('option', { key: v, value: v }, t('strategy' + cap(v))))))
         body = status === null
           ? h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, padding: 24, color: 'var(--dsw-alias-label-secondary)' } },
               h('div', { className: 'sk-spin' }), '…')
@@ -458,8 +479,9 @@ window.__ModuleLoader__.load({
               h('div', null,
                 h('div', { className: 'sk-dir', style: { margin: '4px 0' } }, t('groupHint')),
                 h('div', { className: 'sk-toggles' },
-                  toggle('skills', t('toggleSkills')), toggle('sessions', t('toggleSessions')),
-                  toggle('settings', t('toggleSettings')), toggle('plugins', t('togglePlugins')))),
+                  groupCard('skills', t('toggleSkills')), groupCard('sessions', t('toggleSessions')),
+                  groupCard('settings', t('toggleSettings')), groupCard('plugins', t('togglePlugins'))),
+                h('div', { className: 'sk-dir' }, t('strategyHint'))),
               h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
                 h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
                   h('input', { type: 'checkbox', checked: autoSync, onChange: e => setAutoSync(e.target.checked) }), t('autoSyncLabel')),
