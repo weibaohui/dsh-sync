@@ -275,3 +275,276 @@ test('reconcileRemote: pulls remote-only adds into live, never overwrites local 
   }
 })
 
+
+// ── bothModified preserve: push must NOT clobber the remote version ─────
+
+test('runPush preserve: both-modified files keep the remote version on the branch', async () => {
+  const tmp = await mkdtemp()
+  const bareRepo = join(tmp, 'remote.git')
+  const repoDir = join(tmp, 'repo')
+  const live = join(tmp, 'live')
+  await sh(['init', '--bare', '-b', 'main', bareRepo])
+  const seed = join(tmp, 'seed')
+  await fsp.mkdir(seed, { recursive: true })
+  await fsp.writeFile(join(seed, '.gitattributes'), '*.jsonl merge=union\n')
+  await sh(['init', '-b', 'main'], seed)
+  await gitNoUser(['add', '-A'], seed)
+  await gitNoUser(['commit', '-m', 'seed'], seed)
+  await sh(['push', bareRepo, 'main'], seed)
+  await fsp.mkdir(join(live, '.dsh', 'skills', 'foo'), { recursive: true })
+  await fsp.writeFile(join(live, '.dsh', 'skills', 'foo', 'SKILL.md'), '# foo local')
+  await fsp.writeFile(join(live, '.dsh', 'settings.yaml'), 'provider: local-edit\n')
+  const roots = {
+    dshSkills: join(live, '.dsh', 'skills'),
+    agentsSkills: join(live, '.nope-agents'),
+    agentsLock: join(live, '.nope-lock'),
+    sessions: join(live, '.nope-s'),
+    settingsFile: join(live, '.dsh', 'settings.yaml'),
+    profiles: join(live, '.nope-p'),
+  }
+  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', syncSkills: true, syncSessions: false, syncSettings: true, syncPlugins: false, token: '' }
+  const state = { instanceId: 'testhost-pres' }
+  try {
+    await I.ensureShadowRepo('git', eff, repoDir)
+    await sh(['fetch', bareRepo, 'main'], repoDir)
+    await sh(['checkout', 'main'], repoDir).catch(() => {})
+    await sh(['reset', '--hard', 'FETCH_HEAD'], repoDir)
+    state.lastSyncedCommit = await I.gitCurrentCommit('git', repoDir)
+    // peer edits settings on remote main
+    const peer = join(tmp, 'peer')
+    await sh(['clone', bareRepo, peer])
+    await fsp.mkdir(join(peer, 'settings'), { recursive: true })
+    await fsp.writeFile(join(peer, 'settings', 'settings.yaml'), 'provider: peer-edit\n')
+    await gitNoUser(['add', '-A'], peer)
+    await gitNoUser(['commit', '-m', 'peer edits settings'], peer)
+    await sh(['push', bareRepo, 'main'], peer)
+    // local edits settings too → bothModified; push WITH preserve
+    const push = await I.runPush('git', eff, {
+      repoDir, instanceId: state.instanceId, state, logger: { warn: () => {} }, roots,
+      preserve: ['settings/settings.yaml'],
+    })
+    assert.equal(push.pushed, true)
+    const onBranch = await new Promise((res, rej) => execFile('git', ['show', `${state.lastPushedBranch}:settings/settings.yaml`], { cwd: repoDir }, (e, o) => e ? rej(e) : res(String(o))))
+    assert.equal(onBranch, 'provider: peer-edit\n', 'remote version stays on the push branch (no silent clobber)')
+    const skill = await new Promise((res, rej) => execFile('git', ['show', `${state.lastPushedBranch}:skills/dsh/foo/SKILL.md`], { cwd: repoDir }, (e, o) => e ? rej(e) : res(String(o))))
+    assert.ok(skill.includes('# foo local'), 'uncontested local edits still push')
+  } finally {
+    await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {})
+  }
+})
+
+// ── First join = union: remote-only files survive the snapshot push ─────
+
+test('runPush first join: remote-only files kept, differing settings.yaml protected', async () => {
+  const tmp = await mkdtemp()
+  const bareRepo = join(tmp, 'remote.git')
+  const repoDir = join(tmp, 'repo')
+  const live = join(tmp, 'live')
+  // remote main already has peer content: a skill + a settings file
+  await sh(['init', '--bare', '-b', 'main', bareRepo])
+  const peer = join(tmp, 'peer')
+  await sh(['clone', bareRepo, peer])
+  await fsp.mkdir(join(peer, 'skills', 'dsh', 'bar'), { recursive: true })
+  await fsp.mkdir(join(peer, 'settings'), { recursive: true })
+  await fsp.writeFile(join(peer, '.gitattributes'), '*.jsonl merge=union\n')
+  await fsp.writeFile(join(peer, 'skills', 'dsh', 'bar', 'SKILL.md'), '# bar only on peer')
+  await fsp.writeFile(join(peer, 'settings', 'settings.yaml'), 'provider: peer-provider\npeerKey: 1\n')
+  await gitNoUser(['add', '-A'], peer)
+  await gitNoUser(['commit', '-m', 'peer seeds'], peer)
+  await sh(['push', bareRepo, 'main'], peer)
+  // joining machine has its own skill + its own settings, never synced before
+  await fsp.mkdir(join(live, '.dsh', 'skills', 'foo'), { recursive: true })
+  await fsp.writeFile(join(live, '.dsh', 'skills', 'foo', 'SKILL.md'), '# foo only local')
+  await fsp.writeFile(join(live, '.dsh', 'settings.yaml'), 'provider: joiner-provider\njoinerKey: 1\n')
+  const roots = {
+    dshSkills: join(live, '.dsh', 'skills'),
+    agentsSkills: join(live, '.nope-agents'),
+    agentsLock: join(live, '.nope-lock'),
+    sessions: join(live, '.nope-s'),
+    settingsFile: join(live, '.dsh', 'settings.yaml'),
+    profiles: join(live, '.nope-p'),
+  }
+  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', syncSkills: true, syncSessions: false, syncSettings: true, syncPlugins: false, token: '' }
+  const state = { instanceId: 'testhost-join' }   // no lastSyncedCommit → first join
+  try {
+    const push = await I.runPush('git', eff, { repoDir, instanceId: state.instanceId, state, logger: { warn: () => {} }, roots })
+    assert.equal(push.pushed, true)
+    assert.equal(push.settingsPreserved, true, 'join-time settings divergence reported')
+    const show = (path) => new Promise((res, rej) => execFile('git', ['show', `${state.lastPushedBranch}:${path}`], { cwd: repoDir }, (e, o) => e ? rej(e) : res(String(o))))
+    assert.ok((await show('skills/dsh/bar/SKILL.md')).includes('# bar only on peer'), 'peer-only skill survives first join (union)')
+    assert.ok((await show('skills/dsh/foo/SKILL.md')).includes('# foo only local'), 'local skill pushed')
+    assert.equal(await show('settings/settings.yaml'), 'provider: peer-provider\npeerKey: 1\n', 'remote settings.yaml wins on join (no clobber)')
+  } finally {
+    await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {})
+  }
+})
+
+// ── apiproxy wire format (dsh 0.1.2-rc.1): cookie + slash endpoint + args ──
+
+test('apiproxy: BrowserAuth cookie dance, slash endpoint, args envelope, legacy fallback', async () => {
+  const orig = globalThis.fetch
+  I.__resetApiproxyCache()
+  I.__setConnection({ authenticatedUrl: (base) => base + '/?token=launch-token' })
+  const calls = []
+  let authAttempts = 0
+  const mk = (status, result) => ({ status, headers: { getSetCookie: () => [] }, json: async () => result === undefined ? {} : { result } })
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url)
+    const method = (init.method || 'GET').toUpperCase()
+    if (u.endsWith('/?token=launch-token') && method === 'GET') {
+      authAttempts++
+      return { status: 303, headers: { getSetCookie: () => ['dsh-auth-abc=cookie-value; Path=/; HttpOnly'] } }
+    }
+    const m = u.match(/\/api\/(session[./][a-z]+)$/)
+    if (m && method === 'POST') {
+      const body = JSON.parse(init.body)
+      calls.push({ endpoint: m[1], method: body.method, payload: body.payload, cookie: init.headers && init.headers.Cookie })
+      if (authAttempts === 0) return mk(401)
+      if (m[1] === 'session/create') return mk(200, { ok: true, value: { sessionId: 'session-1', agentPreset: 'standard' } })
+      if (m[1] === 'session.list') return mk(200, { ok: true, value: { sessionId: 'session-legacy' } })
+      return mk(404)   // slash endpoint the host does not know → legacy fallback
+    }
+    return mk(404)
+  }
+  try {
+    // 1. bare 401 → mint cookie → retry with Cookie header
+    const value = await I.apiproxy('session/create', { cwd: '/tmp' })
+    assert.equal(value.sessionId, 'session-1')
+    assert.equal(calls[0].cookie, undefined, 'first attempt has no cookie')
+    assert.equal(calls[1].cookie, 'dsh-auth-abc=cookie-value', 'retry carries minted cookie')
+    assert.equal(calls[1].method, 'session/create', 'slash endpoint in envelope method')
+    assert.deepEqual(calls[1].payload, { args: { request: { cwd: '/tmp' } } }, 'payload wrapped in args.request')
+    // 2. legacy fallback: slash endpoint 404s → dotted + flat payload
+    const legacy = await I.apiproxy('session/list', {})
+    assert.equal(legacy.sessionId, 'session-legacy')
+    assert.equal(calls[2].method, 'session/list', 'slash tried first')
+    assert.equal(calls[3].endpoint, 'session.list', 'legacy dotted endpoint retried')
+    assert.deepEqual(calls[3].payload, {}, 'legacy payload stays flat')
+  } finally {
+    globalThis.fetch = orig
+    I.__resetApiproxyCache()
+    I.__setConnection(null)
+  }
+})
+
+// ── Machine-owned plugin manifests: pull/reconcile never overwrite existing ──
+
+test('reconcileRemote: existing plugin manifest kept, new plugin files applied', async () => {
+  const tmp = await mkdtemp()
+  const bareRepo = join(tmp, 'remote.git')
+  const repoDir = join(tmp, 'repo')
+  const live = join(tmp, 'live')
+  await sh(['init', '--bare', '-b', 'main', bareRepo])
+  const seed = join(tmp, 'seed')
+  await fsp.mkdir(seed, { recursive: true })
+  await fsp.writeFile(join(seed, '.gitattributes'), '*.jsonl merge=union\n')
+  await sh(['init', '-b', 'main'], seed)
+  await gitNoUser(['add', '-A'], seed)
+  await gitNoUser(['commit', '-m', 'seed'], seed)
+  await sh(['push', bareRepo, 'main'], seed)
+  // live: own web profile manifest + own skill
+  await fsp.mkdir(join(live, '.dsh', 'skills', 'foo'), { recursive: true })
+  await fsp.mkdir(join(live, '.dsh', 'profiles', 'web'), { recursive: true })
+  await fsp.writeFile(join(live, '.dsh', 'skills', 'foo', 'SKILL.md'), '# foo')
+  await fsp.writeFile(join(live, '.dsh', 'profiles', 'web', 'package.json'), '{"bundles":["ours"]}')
+  const roots = {
+    dshSkills: join(live, '.dsh', 'skills'),
+    agentsSkills: join(live, '.nope-agents'),
+    agentsLock: join(live, '.nope-lock'),
+    sessions: join(live, '.nope-s'),
+    settingsFile: join(live, '.nope-settings'),
+    profiles: join(live, '.dsh', 'profiles'),
+  }
+  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', syncSkills: true, syncSessions: false, syncSettings: false, syncPlugins: true, token: '' }
+  const state = { instanceId: 'testhost-plug' }
+  try {
+    await I.ensureShadowRepo('git', eff, repoDir)
+    await sh(['fetch', bareRepo, 'main'], repoDir)
+    await sh(['checkout', 'main'], repoDir).catch(() => {})
+    await sh(['reset', '--hard', 'FETCH_HEAD'], repoDir)
+    state.lastSyncedCommit = await I.gitCurrentCommit('git', repoDir)
+    // peer (old plugin version) replaced web/package.json AND added a new profile dir
+    const peer = join(tmp, 'peer')
+    await sh(['clone', bareRepo, peer])
+    await fsp.mkdir(join(peer, 'plugins', 'web'), { recursive: true })
+    await fsp.mkdir(join(peer, 'plugins', 'their-extra'), { recursive: true })
+    await fsp.writeFile(join(peer, 'plugins', 'web', 'package.json'), '{"bundles":["theirs","dsh-at-file"]}')
+    await fsp.writeFile(join(peer, 'plugins', 'their-extra', 'package.json'), '{"bundles":["theirs-extra"]}')
+    await gitNoUser(['add', '-A'], peer)
+    await gitNoUser(['commit', '-m', 'peer swaps manifests'], peer)
+    await sh(['push', bareRepo, 'main'], peer)
+    const rec = await I.reconcileRemote('git', eff, { repoDir, state, logger: { warn: () => {} }, roots })
+    assert.equal(rec.reconciled, true)
+    assert.ok(rec.localKept.includes('plugins/web/package.json'), 'existing manifest reported as localKept: ' + JSON.stringify(rec.localKept))
+    assert.equal(fs.readFileSync(join(live, '.dsh', 'profiles', 'web', 'package.json'), 'utf8'), '{"bundles":["ours"]}', 'existing manifest NOT overwritten (boot safety)')
+    assert.equal(fs.readFileSync(join(live, '.dsh', 'profiles', 'their-extra', 'package.json'), 'utf8'), '{"bundles":["theirs-extra"]}', 'new profile manifests still arrive (union)')
+  } finally {
+    await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {})
+  }
+})
+
+// ── Pending-both baseline bookkeeping: unresolved files keep their base ──
+
+test('reconcile keeps per-file baseline for unresolved bothModified across syncs', async () => {
+  const tmp = await mkdtemp()
+  const bareRepo = join(tmp, 'remote.git')
+  const repoDir = join(tmp, 'repo')
+  const live = join(tmp, 'live')
+  await sh(['init', '--bare', '-b', 'main', bareRepo])
+  const seed = join(tmp, 'seed')
+  await fsp.mkdir(seed, { recursive: true })
+  await fsp.writeFile(join(seed, '.gitattributes'), '*.jsonl merge=union\n')
+  await fsp.mkdir(join(seed, 'skills', 'dsh', 'x'), { recursive: true })
+  await fsp.writeFile(join(seed, 'skills', 'dsh', 'x', 'SKILL.md'), 'base\n')
+  await sh(['init', '-b', 'main'], seed)
+  await gitNoUser(['add', '-A'], seed)
+  await gitNoUser(['commit', '-m', 'seed'], seed)
+  await sh(['push', bareRepo, 'main'], seed)
+  const roots = {
+    dshSkills: join(live, '.dsh', 'skills'),
+    agentsSkills: join(live, '.nope-agents'),
+    agentsLock: join(live, '.nope-lock'),
+    sessions: join(live, '.nope-s'),
+    settingsFile: join(live, '.nope-settings'),
+    profiles: join(live, '.nope-p'),
+  }
+  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', syncSkills: true, syncSessions: false, syncSettings: false, syncPlugins: false, token: '' }
+  const state = { instanceId: 'testhost-base' }
+  try {
+    // establish baseline B0
+    await I.ensureShadowRepo('git', eff, repoDir)
+    await sh(['fetch', bareRepo, 'main'], repoDir)
+    await sh(['checkout', 'main'], repoDir).catch(() => {})
+    await sh(['reset', '--hard', 'FETCH_HEAD'], repoDir)
+    state.lastSyncedCommit = await I.gitCurrentCommit('git', repoDir)
+    const b0 = state.lastSyncedCommit
+    // local edits X, peer edits X on main
+    await fsp.mkdir(join(live, '.dsh', 'skills', 'x'), { recursive: true })
+    await fsp.writeFile(join(live, '.dsh', 'skills', 'x', 'SKILL.md'), 'base\nlocal edit\n')
+    const peer = join(tmp, 'peer')
+    await sh(['clone', bareRepo, peer])
+    await fsp.writeFile(join(peer, 'skills', 'dsh', 'x', 'SKILL.md'), 'base\nremote edit\n')
+    await gitNoUser(['add', '-A'], peer)
+    await gitNoUser(['commit', '-m', 'peer edits x'], peer)
+    await sh(['push', bareRepo, 'main'], peer)
+    // sync 1: detect bothModified, preserve, baseline must NOT swallow the file
+    const rec1 = await I.reconcileRemote('git', eff, { repoDir, state, logger: { warn: () => {} }, roots })
+    assert.equal(rec1.bothModified.length, 1)
+    assert.equal(rec1.bothModified[0].baseCommit, b0, 'bothModified carries its true base commit')
+    await I.runPush('git', eff, { repoDir, instanceId: state.instanceId, state, logger: { warn: () => {} }, roots, preserve: ['skills/dsh/x/SKILL.md'] })
+    assert.notEqual(state.lastSyncedCommit, b0, 'global baseline advanced')
+    assert.equal(state.pendingBoth['skills/dsh/x/SKILL.md'], b0, 'unresolved file base kept in pendingBoth')
+    // sync 2 (no new remote changes): fresh bothModified empty, pending survives
+    const rec2 = await I.reconcileRemote('git', eff, { repoDir, state, logger: { warn: () => {} }, roots })
+    assert.equal(rec2.bothModified.length, 0)
+    assert.equal(state.pendingBoth['skills/dsh/x/SKILL.md'], b0, 'pending survives unchanged remote')
+    // align resolves: live = semantic merge, pending cleared → next push propagates
+    await fsp.writeFile(join(live, '.dsh', 'skills', 'x', 'SKILL.md'), 'base\nlocal edit\nremote edit\n')
+    delete state.pendingBoth['skills/dsh/x/SKILL.md']
+    await I.runPush('git', eff, { repoDir, instanceId: state.instanceId, state, logger: { warn: () => {} }, roots })
+    const merged = await new Promise((res, rej) => execFile('git', ['show', `${state.lastPushedBranch}:skills/dsh/x/SKILL.md`], { cwd: repoDir }, (e, o) => e ? rej(e) : res(String(o))))
+    assert.equal(merged, 'base\nlocal edit\nremote edit\n', 'merged version reaches the push branch')
+  } finally {
+    await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {})
+  }
+})
