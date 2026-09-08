@@ -509,6 +509,7 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
   try { changedRaw = await gitExec(binary, ['diff', '--name-only', lastSynced, 'FETCH_HEAD'], repoDir) } catch {}
   const changed = changedRaw.split(/\r?\n/).map(s => s.trim()).filter(Boolean)
   let applied = 0, skipped = 0
+  state.pendingBoth = state.pendingBoth && typeof state.pendingBoth === 'object' ? state.pendingBoth : {}
   for (const p of changed) {
     const livePath = resolveLivePath(spec, p)
     if (!livePath) { skipped++; continue }
@@ -516,12 +517,22 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
     try { liveBuf = await fsP.readFile(livePath) } catch {}
     // 机器专属保护：本地已有的插件清单文件绝不被远端覆盖（同 reconcileRemote）
     if ((p === 'plugins' || p.startsWith('plugins/')) && liveBuf !== null) { skipped++; continue }
-    let lastSyncedBuf = null
-    try { lastSyncedBuf = await gitShowBuf(binary, `${lastSynced}:${p}`, repoDir) } catch { lastSyncedBuf = Buffer.alloc(0) }
-    const untouched = liveBuf === null ? (lastSyncedBuf.length === 0) : Buffer.compare(liveBuf, lastSyncedBuf) === 0
-    if (!untouched) { skipped++; continue }   // 本地动过 → 留给下个 push
+    let remoteBuf = null
+    try { remoteBuf = await gitShowBuf(binary, `FETCH_HEAD:${p}`, repoDir) } catch { remoteBuf = null }
+    if (remoteBuf === null) { skipped++; delete state.pendingBoth[p]; continue }   // 远端删除不镜像
+    if (liveBuf !== null && Buffer.compare(liveBuf, remoteBuf) === 0) { delete state.pendingBoth[p]; continue }
+    const fileBase = state.pendingBoth[p] || lastSynced
+    let baseBuf = null
+    try { baseBuf = await gitShowBuf(binary, `${fileBase}:${p}`, repoDir) } catch { baseBuf = Buffer.alloc(0) }
+    const untouched = liveBuf === null ? (baseBuf.length === 0) : Buffer.compare(liveBuf, baseBuf) === 0
+    if (!untouched) {
+      // 本地动过 → 留给对齐/下个 push；基线按文件记账
+      if (!state.pendingBoth[p]) state.pendingBoth[p] = fileBase
+      skipped++
+      continue
+    }
+    delete state.pendingBoth[p]
     try {
-      const remoteBuf = await gitShowBuf(binary, `FETCH_HEAD:${p}`, repoDir)
       await atomicWriteFile(livePath, remoteBuf)
       applied++
     } catch { skipped++ }
@@ -564,6 +575,10 @@ async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
   let changedRaw = ''
   try { changedRaw = await gitExec(binary, ['diff', '--name-only', lastSynced, 'FETCH_HEAD'], repoDir) } catch {}
   const changed = changedRaw.split(/\r?\n/).map(s => s.trim()).filter(Boolean)
+  // 逐文件基线：bothModified 文件在解决前基线不能跟着 lastSyncedCommit 前进
+  // （真机实证：基线被推进到远端 tip 后，AI 对齐看到「远端==基线 → 保留本机」，
+  // 对端改动在下一次推送时被覆盖）。pendingBoth 记住每个未解决文件的真基线。
+  state.pendingBoth = state.pendingBoth && typeof state.pendingBoth === 'object' ? state.pendingBoth : {}
   const applied = []        // safely written back to live
   const bothModified = []   // both sides changed → AI align / conflict PR
   const remoteDeleted = []  // gone on remote; live keeps its copy
@@ -573,21 +588,49 @@ async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
     if (!livePath) continue
     let remoteBuf = null
     try { remoteBuf = await gitShowBuf(binary, `FETCH_HEAD:${p}`, repoDir) } catch { remoteBuf = null }
-    if (remoteBuf === null) { remoteDeleted.push(p); continue }
+    if (remoteBuf === null) {
+      remoteDeleted.push(p)
+      delete state.pendingBoth[p]
+      continue
+    }
     let liveBuf = null
     try { liveBuf = await fsP.readFile(livePath) } catch {}
     // 插件清单是机器专属启动配置：本地已有的文件绝不被远端覆盖（真机实证：对端
     // package.json 覆盖本机 web profile 的 bundle 列表 → 宿主重启解析不到 bundle，
     // launchd crash loop）。本地没有的清单文件照常回填，新机器的清单以并集到来。
     if ((p === 'plugins' || p.startsWith('plugins/')) && liveBuf !== null) { localKept.push(p); continue }
-    let lastSyncedBuf = null
-    try { lastSyncedBuf = await gitShowBuf(binary, `${lastSynced}:${p}`, repoDir) } catch { lastSyncedBuf = Buffer.alloc(0) }
-    const untouched = liveBuf === null ? (lastSyncedBuf.length === 0) : Buffer.compare(liveBuf, lastSyncedBuf) === 0
-    if (!untouched) { bothModified.push({ shadowPath: p, livePath }); continue }
+    // 未解决文件的基线固定在首次发现冲突时的 commit，其余文件跟随 lastSynced
+    const fileBase = state.pendingBoth[p] || lastSynced
+    let baseBuf = null
+    try { baseBuf = await gitShowBuf(binary, `${fileBase}:${p}`, repoDir) } catch { baseBuf = Buffer.alloc(0) }
+    if (liveBuf !== null && Buffer.compare(liveBuf, remoteBuf) === 0) {
+      // live 已与远端一致（对齐已收敛/手动同步过）→ 销账
+      delete state.pendingBoth[p]
+      continue
+    }
+    const untouched = liveBuf === null ? (baseBuf.length === 0) : Buffer.compare(liveBuf, baseBuf) === 0
+    if (!untouched) {
+      if (!state.pendingBoth[p]) state.pendingBoth[p] = fileBase
+      bothModified.push({ shadowPath: p, livePath, baseCommit: state.pendingBoth[p] })
+      continue
+    }
+    delete state.pendingBoth[p]
     try { await atomicWriteFile(livePath, remoteBuf); applied.push(p) } catch {}
   }
+  // 长期挂着的销账清理：不在本轮变更集里且 live 已与远端一致
+  for (const p of Object.keys(state.pendingBoth)) {
+    if (changed.includes(p)) continue
+    const livePath = resolveLivePath(spec, p)
+    if (!livePath) { delete state.pendingBoth[p]; continue }
+    let remoteBuf = null
+    try { remoteBuf = await gitShowBuf(binary, `FETCH_HEAD:${p}`, repoDir) } catch { remoteBuf = null }
+    let liveBuf = null
+    try { liveBuf = await fsP.readFile(livePath) } catch {}
+    if (remoteBuf === null || (liveBuf !== null && Buffer.compare(liveBuf, remoteBuf) === 0)) delete state.pendingBoth[p]
+  }
   // advance shadow baseline to FETCH_HEAD — safe items now match live, so the
-  // subsequent push overlay keeps every remote-only file instead of deleting it
+  // subsequent push overlay keeps every remote-only file instead of deleting it.
+  // (记录用的 lastSyncedCommit 同样前进：未解决文件的真基线在 pendingBoth 里逐文件记账)
   await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
   await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
   state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
@@ -662,7 +705,7 @@ const ALIGN_PROMPT_ZH = [
   '## 待合并文件（两边都改过，共 {{fileCount}} 个）',
   '{{fileList}}',
   '每个文件的三个版本：本机版直接读 live 路径；远端版 `git -C {{shadowDir}} show FETCH_HEAD:<影子路径>`；共同基线 `git -C {{shadowDir}} show {{lastSynced}}:<影子路径>`（可能不存在）。',
-  '若「远端版」与「共同基线」相同，说明远端没有新改动：该文件直接保留本机版即可。',
+  '**基线以文件清单里标注的「该文件基线」为准**（可能与全局基线不同——未解决冲突的文件基线固定在首次发现冲突时，不随后续同步前进）。若「远端版」与「该文件基线」相同，说明远端没有新改动：该文件直接保留本机版即可。',
   '',
   '## 规则（硬性）',
   '1. 只允许修改上面清单里的 live 文件；**不得删除**任何 live 文件或远端独有内容；不准碰同步根之外的文件。',
@@ -934,7 +977,18 @@ module.exports = {
           // reconcile first: pull remote-only/untouched changes into live so
           // the full-snapshot push below never deletes another replica's adds
           result.reconcile = await reconcileRemote(eff.gitBinary, eff, ctx2).catch(e => { result.reconcileError = String(e && e.message); return null })
-          const both = (result.reconcile && Array.isArray(result.reconcile.bothModified)) ? result.reconcile.bothModified : []
+          const fresh = (result.reconcile && Array.isArray(result.reconcile.bothModified)) ? result.reconcile.bothModified : []
+          state.pendingBoth = state.pendingBoth && typeof state.pendingBoth === 'object' ? state.pendingBoth : {}
+          // 已挂账未解决的 bothModified 一并纳入（reconcile 只报本轮变更集里的文件，
+          // 但未解决文件的基线还在 pendingBoth 里，push 时同样要 preserve）
+          const pendings = Object.keys(state.pendingBoth)
+            .filter(p => !fresh.some(f => f.shadowPath === p))
+            .map(p => {
+              const livePath = resolveLivePath(syncSpec(eff, defaultRoots()), p)
+              return livePath ? { shadowPath: p, livePath, baseCommit: state.pendingBoth[p] } : null
+            })
+            .filter(Boolean)
+          const both = [...fresh, ...pendings]
           // 双方都改过的文件不随快照推送（preserve）：远端版本留在 main，本机版本留在
           // live，等 AI 智能对齐做语义合并——不再静默覆盖
           result.push = await runPush(eff.gitBinary, eff, { ...ctx2, preserve: both.map(f => f.shadowPath) }).catch(e => { result.pushError = String(e && e.message); return null })
@@ -990,7 +1044,7 @@ module.exports = {
       const backupDir = join(syncDir, 'align-backups', new Date().toISOString().replace(/[:.]/g, '-'))
       await fsP.mkdir(backupDir, { recursive: true })
       const fileList = both.length
-        ? both.map((f, i) => `${i + 1}. ${f.shadowPath}（本机：${displayPath(f.livePath)}）`).join('\n')
+        ? both.map((f, i) => `${i + 1}. ${f.shadowPath}（本机：${displayPath(f.livePath)}；该文件基线：${f.baseCommit || '同全局基线'}）`).join('\n')
         : '（无——确定性同步已处理全部差异）'
       const roots = defaultRoots()
       const prompt = substituteParams(ALIGN_PROMPT_ZH, {
@@ -1004,7 +1058,16 @@ module.exports = {
       alignState.active = true
       const job = createAgentRunJob({
         prompt, dir: repoDir, jobs: alignRunJobs, logger: ctx.logger, sessions: sessionsSvc, token: eff.token,
-        onFinish: () => { alignState.active = false },
+        onFinish: () => {
+          alignState.active = false
+          // 对齐成功 → 销账（本机版本已是语义合并结果，随下一次推送传播）+ 补一次
+          // 确定性同步把它推上去；失败则保留挂账，文件继续被 preserve 保护
+          if (job.code === 0 && both.length > 0) {
+            for (const f of both) delete state.pendingBoth[f.shadowPath]
+            saveState()
+            runSync({ autoAlign: false }).catch(e => ctx.logger.warn(`dsh-sync: post-align sync: ${e && e.message}`))
+          }
+        },
       })
       return job
     }
@@ -1053,8 +1116,7 @@ module.exports = {
               syncing: syncRun !== null,
               pendingConflict: state.lastResult && state.lastResult.push && state.lastResult.push.conflict === true
                 ? { branch: state.lastPushedBranch, prNumber: state.lastPrNumber } : null,
-              bothModifiedPending: (state.lastResult && state.lastResult.reconcile && Array.isArray(state.lastResult.reconcile.bothModified))
-                ? state.lastResult.reconcile.bothModified.map(f => f.shadowPath) : [],
+              bothModifiedPending: Object.keys(state.pendingBoth && typeof state.pendingBoth === 'object' ? state.pendingBoth : {}),
               settingsPreserved: !!(state.lastResult && state.lastResult.push && state.lastResult.push.settingsPreserved),
               alignRunning: alignState.active,
             })
@@ -1136,7 +1198,15 @@ module.exports = {
             try { syncResult = await runSync({ autoAlign: false }) }
             catch (e) { sendJson(res, 400, { error: '同步预检失败：' + String(e && e.message || e) }); return }
             const rec = syncResult && syncResult.reconcile
-            const both = (rec && Array.isArray(rec.bothModified)) ? rec.bothModified : []
+            const fresh = (rec && Array.isArray(rec.bothModified)) ? rec.bothModified : []
+            state.pendingBoth = state.pendingBoth && typeof state.pendingBoth === 'object' ? state.pendingBoth : {}
+            const both = [...fresh, ...Object.keys(state.pendingBoth)
+              .filter(p => !fresh.some(f => f.shadowPath === p))
+              .map(p => {
+                const livePath = resolveLivePath(syncSpec(eff, defaultRoots()), p)
+                return livePath ? { shadowPath: p, livePath, baseCommit: state.pendingBoth[p] } : null
+              })
+              .filter(Boolean)]
             const job = await startAlignJob(eff, both)
             sendJson(res, 202, {
               jobId: job.id, status: job.status,

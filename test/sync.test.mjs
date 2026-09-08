@@ -482,3 +482,69 @@ test('reconcileRemote: existing plugin manifest kept, new plugin files applied',
     await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {})
   }
 })
+
+// ── Pending-both baseline bookkeeping: unresolved files keep their base ──
+
+test('reconcile keeps per-file baseline for unresolved bothModified across syncs', async () => {
+  const tmp = await mkdtemp()
+  const bareRepo = join(tmp, 'remote.git')
+  const repoDir = join(tmp, 'repo')
+  const live = join(tmp, 'live')
+  await sh(['init', '--bare', '-b', 'main', bareRepo])
+  const seed = join(tmp, 'seed')
+  await fsp.mkdir(seed, { recursive: true })
+  await fsp.writeFile(join(seed, '.gitattributes'), '*.jsonl merge=union\n')
+  await fsp.mkdir(join(seed, 'skills', 'dsh', 'x'), { recursive: true })
+  await fsp.writeFile(join(seed, 'skills', 'dsh', 'x', 'SKILL.md'), 'base\n')
+  await sh(['init', '-b', 'main'], seed)
+  await gitNoUser(['add', '-A'], seed)
+  await gitNoUser(['commit', '-m', 'seed'], seed)
+  await sh(['push', bareRepo, 'main'], seed)
+  const roots = {
+    dshSkills: join(live, '.dsh', 'skills'),
+    agentsSkills: join(live, '.nope-agents'),
+    agentsLock: join(live, '.nope-lock'),
+    sessions: join(live, '.nope-s'),
+    settingsFile: join(live, '.nope-settings'),
+    profiles: join(live, '.nope-p'),
+  }
+  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', syncSkills: true, syncSessions: false, syncSettings: false, syncPlugins: false, token: '' }
+  const state = { instanceId: 'testhost-base' }
+  try {
+    // establish baseline B0
+    await I.ensureShadowRepo('git', eff, repoDir)
+    await sh(['fetch', bareRepo, 'main'], repoDir)
+    await sh(['checkout', 'main'], repoDir).catch(() => {})
+    await sh(['reset', '--hard', 'FETCH_HEAD'], repoDir)
+    state.lastSyncedCommit = await I.gitCurrentCommit('git', repoDir)
+    const b0 = state.lastSyncedCommit
+    // local edits X, peer edits X on main
+    await fsp.mkdir(join(live, '.dsh', 'skills', 'x'), { recursive: true })
+    await fsp.writeFile(join(live, '.dsh', 'skills', 'x', 'SKILL.md'), 'base\nlocal edit\n')
+    const peer = join(tmp, 'peer')
+    await sh(['clone', bareRepo, peer])
+    await fsp.writeFile(join(peer, 'skills', 'dsh', 'x', 'SKILL.md'), 'base\nremote edit\n')
+    await gitNoUser(['add', '-A'], peer)
+    await gitNoUser(['commit', '-m', 'peer edits x'], peer)
+    await sh(['push', bareRepo, 'main'], peer)
+    // sync 1: detect bothModified, preserve, baseline must NOT swallow the file
+    const rec1 = await I.reconcileRemote('git', eff, { repoDir, state, logger: { warn: () => {} }, roots })
+    assert.equal(rec1.bothModified.length, 1)
+    assert.equal(rec1.bothModified[0].baseCommit, b0, 'bothModified carries its true base commit')
+    await I.runPush('git', eff, { repoDir, instanceId: state.instanceId, state, logger: { warn: () => {} }, roots, preserve: ['skills/dsh/x/SKILL.md'] })
+    assert.notEqual(state.lastSyncedCommit, b0, 'global baseline advanced')
+    assert.equal(state.pendingBoth['skills/dsh/x/SKILL.md'], b0, 'unresolved file base kept in pendingBoth')
+    // sync 2 (no new remote changes): fresh bothModified empty, pending survives
+    const rec2 = await I.reconcileRemote('git', eff, { repoDir, state, logger: { warn: () => {} }, roots })
+    assert.equal(rec2.bothModified.length, 0)
+    assert.equal(state.pendingBoth['skills/dsh/x/SKILL.md'], b0, 'pending survives unchanged remote')
+    // align resolves: live = semantic merge, pending cleared → next push propagates
+    await fsp.writeFile(join(live, '.dsh', 'skills', 'x', 'SKILL.md'), 'base\nlocal edit\nremote edit\n')
+    delete state.pendingBoth['skills/dsh/x/SKILL.md']
+    await I.runPush('git', eff, { repoDir, instanceId: state.instanceId, state, logger: { warn: () => {} }, roots })
+    const merged = await new Promise((res, rej) => execFile('git', ['show', `${state.lastPushedBranch}:skills/dsh/x/SKILL.md`], { cwd: repoDir }, (e, o) => e ? rej(e) : res(String(o))))
+    assert.equal(merged, 'base\nlocal edit\nremote edit\n', 'merged version reaches the push branch')
+  } finally {
+    await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {})
+  }
+})
