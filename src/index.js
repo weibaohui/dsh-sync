@@ -1057,7 +1057,9 @@ module.exports = {
       })
       alignState.active = true
       const job = createAgentRunJob({
-        prompt, dir: repoDir, jobs: alignRunJobs, logger: ctx.logger, sessions: sessionsSvc, token: eff.token,
+        // cwd 提到 home：沙箱 workspace 必须覆盖 live 同步根、备份目录与影子仓库，
+        // 否则 agent 写备份/写 live 全被拦（真机实证：cwd=影子仓库时写 ~/.dsh/dsh-sync 被拒）
+        prompt, dir: homedir(), jobs: alignRunJobs, logger: ctx.logger, sessions: sessionsSvc, token: eff.token,
         onFinish: () => {
           alignState.active = false
           // 对齐成功 → 销账（本机版本已是语义合并结果，随下一次推送传播）+ 补一次
@@ -1173,7 +1175,7 @@ module.exports = {
             const prompt = substituteParams(CONFLICT_PROMPT_ZH, {
               repoUrl: eff.repoUrl, shadowDir: repoDir, branch, prNumber, token: eff.token,
             })
-            const job = createAgentRunJob({ prompt, dir: repoDir, jobs: conflictRunJobs, logger: ctx.logger, sessions: sessionsSvc, token: eff.token })
+            const job = createAgentRunJob({ prompt, dir: homedir(), jobs: conflictRunJobs, logger: ctx.logger, sessions: sessionsSvc, token: eff.token })
             sendJson(res, 202, { jobId: job.id, status: job.status })
             return
           }
