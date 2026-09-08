@@ -16,10 +16,17 @@
  * Architecture: a shadow working tree at $DSH_HOME/dsh-sync/repo mirrors
  * selected live roots. Push = fetch origin/main → reset shadow to origin/main
  * → overlay live snapshot → branch → commit → push → create PR → mergeable?
- * merge : surface a conflict action. Pull = fetch → for files remote changed
- * since lastSyncedCommit, write the remote version back to live only when the
- * local copy is untouched (three-way; locally-modified files wait for the
- * next push). Conflicts an agent cannot auto-resolve stay open as PRs.
+ * merge (+ delete the sync branch) : surface a conflict action. Files both
+ * sides changed (bothModified) are NOT pushed with the snapshot — the remote
+ * version stays on main and the local version stays in live, and with
+ * conflictMode=ai an in-process agent semantically merges them (same channel
+ * skills-management share uses). First join (no common baseline) is a union:
+ * remote-only files are restored instead of being deleted by the snapshot,
+ * and a differing remote settings.yaml wins until an align merges per-key.
+ * Pull = fetch → for files remote changed since lastSyncedCommit, write the
+ * remote version back to live only when the local copy is untouched (three-
+ * way; locally-modified files wait for the next push). Conflicts an agent
+ * cannot auto-resolve stay open as PRs.
  */
 
 const { execFile } = require('node:child_process')
@@ -367,9 +374,12 @@ async function ensureShadowRepo(binary, eff, repoDir) {
 
 // ── Three-way push: local deltas → branch → PR → merge | conflict ──
 
-async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots }) {
+async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots, preserve }) {
   const remote = await ensureShadowRepo(binary, eff, repoDir)
   const spec = syncSpec(eff, roots)
+  // 首次接入判定必须在任何基线推进之前读
+  const firstJoin = !state.lastSyncedCommit
+  let settingsPreserved = false
 
   // 1. fetch origin/main → FETCH_HEAD (canonical baseline)
   try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
@@ -385,6 +395,35 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots 
   await gitExec(binary, ['checkout', '--detach', baseRef], repoDir).catch(() => {})
   // 3. overlay live snapshot onto the baseline: shadow now = baseline + local deltas
   await mirrorLiveToShadow(spec, repoDir)
+
+  if (firstJoin && hasRemote) {
+    // 首次接入 = 并集加入。全量快照覆盖会把"远端有、本机没有"的文件当作本地删除
+    // 推出去（实测新机首推从 main 删掉另一台机器 1.3 万个文件）。没有共同基线时
+    // 无法区分"本地删过"和"本地从来没有"，一律按后者处理：恢复远端独有文件。
+    let deletedRaw = ''
+    try { deletedRaw = await gitExec(binary, ['diff', '--name-only', '--diff-filter=D', 'FETCH_HEAD'], repoDir) } catch {}
+    for (const p of deletedRaw.split(/\r?\n/).map(s => s.trim()).filter(Boolean)) {
+      await gitExec(binary, ['checkout', 'FETCH_HEAD', '--', p], repoDir).catch(() => {})
+    }
+    // settings.yaml 带各机凭证与模型配置：首次接入若与本机不同，整文件覆盖会在下次
+    // pull 时把对端机器的配置整份换掉（实测打挂过对端 LLM 供应商配置）。保留远端
+    // 版本，差异留给 AI 智能对齐做逐键合并。
+    let remoteSettings = null
+    try { remoteSettings = await gitShowBuf(binary, 'FETCH_HEAD:settings/settings.yaml', repoDir) } catch { remoteSettings = null }
+    if (remoteSettings !== null) {
+      const shadowSettings = await fsP.readFile(join(repoDir, 'settings', 'settings.yaml')).catch(() => null)
+      if (!shadowSettings || Buffer.compare(shadowSettings, remoteSettings) !== 0) {
+        await atomicWriteFile(join(repoDir, 'settings', 'settings.yaml'), remoteSettings)
+        settingsPreserved = true
+      }
+    }
+  }
+
+  // 双方都改过的文件不随快照覆盖推送：恢复成远端版本，交给 AI 智能对齐/用户裁决。
+  // 否则本分支永远基于 main tip、PR 恒可合并 = 对端改动被静默覆盖（真机实证）。
+  for (const p of preserve || []) {
+    await gitExec(binary, ['checkout', 'FETCH_HEAD', '--', p], repoDir).catch(() => {})
+  }
 
   // 4. commit on a fresh branch
   await gitExec(binary, ['checkout', '-b', branch], repoDir)
@@ -407,7 +446,7 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots 
     await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
     state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
     state.lastPushedBranch = branch
-    return { pushed: true, prSkipped: true, branch }
+    return { pushed: true, prSkipped: true, branch, settingsPreserved }
   }
   // 同仓库 PR 的 head 就是分支名（`user:branch` 是 fork PR 语法，GitCode 会 400）
   const prBody = { head: branch, base: eff.branch, title: `dsh-sync ${instanceId}`, body: `Auto sync from ${instanceId}` }
@@ -432,15 +471,18 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots 
   if (mergeable) {
     const mr = await mergePullRequest(eff.token, parsed.owner, parsed.repo, prNumber, 'squash')
     if (!mr.ok) throw new Error(`合并 PR 失败（HTTP ${mr.status}）`)
+    // 合并即删远端 sync 分支（best effort）：不删的话每次同步遗留一个分支，
+    // 真机仓库实测两天积了 970+ 个 sync/* 分支
+    await gitExec(binary, ['push', remote, '--delete', branch], repoDir).catch(() => {})
     // advance shadow to the merged main
     await gitExec(binary, ['fetch', remote, eff.branch], repoDir).catch(() => {})
     await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
     await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
     state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
-    return { pushed: true, merged: true, prNumber }
+    return { pushed: true, merged: true, prNumber, settingsPreserved }
   }
   // conflict → leave PR open; client shows the "AI 解决冲突" action button
-  return { pushed: true, prConflict: true, prNumber, conflict: true }
+  return { pushed: true, prConflict: true, prNumber, conflict: true, settingsPreserved }
 }
 
 // ── Three-way pull: remote deltas → live, only for untouched files ──
@@ -613,6 +655,7 @@ const ALIGN_PROMPT_ZH = [
   '## 待合并文件（两边都改过，共 {{fileCount}} 个）',
   '{{fileList}}',
   '每个文件的三个版本：本机版直接读 live 路径；远端版 `git -C {{shadowDir}} show FETCH_HEAD:<影子路径>`；共同基线 `git -C {{shadowDir}} show {{lastSynced}}:<影子路径>`（可能不存在）。',
+  '若「远端版」与「共同基线」相同，说明远端没有新改动：该文件直接保留本机版即可。',
   '',
   '## 规则（硬性）',
   '1. 只允许修改上面清单里的 live 文件；**不得删除**任何 live 文件或远端独有内容；不准碰同步根之外的文件。',
@@ -629,21 +672,74 @@ const ALIGN_PROMPT_ZH = [
 ].join('\n')
 
 // apiproxy client: dsh web 的 /api HTTP RPC（web 客户端同款），创建主对话级 session。
-// 关键区别：apiproxy session.create 建的是 web 主对话级 agent（agentPreset=standard
-// + dsh-base 全工具，含 bash——实测 tool/call=bash + pwd 跑通）；而 agents.create 子 agent
-// 是精简 scope（只有 thinking + 插件全局工具，无 bash）。故 conflict 走 apiproxy 不走
-// agents.create。base URL 可由 DSH_WEB_URL 覆盖，默认本地 3080。
+// 关键区别：apiproxy session/create 建的是 web 主对话级 agent（agentPreset=standard
+// + dsh-base 全工具，含 bash）；而 agents.create 子 agent 是精简 scope（无 bash）。
+// 故 conflict/align 走 apiproxy 不走 agents.create。base URL 可由 DSH_WEB_URL 覆盖。
+//
+// dsh 0.1.2-rc.1 两处 wire breaking（真机联调实证，2026-09-08）：
+// ① BrowserAuth 上线：/api 无凭证一律 401——须先 GET authenticatedUrl（303 铸
+//    dsh-auth-* cookie），后续请求带 Cookie 头；token 只认 GET /，?token= 直上 /api 无效。
+// ② RPC 端点从点号（session.create）改成斜杠两段式（session/create，与 typert
+//    namespace/method 对应），payload 必须包成 {args:{request:…}}；0.1.1-rc.2 仍是
+//    点号 + 平铺 payload，404 时回退重试。cookie 由宿主 connection 服务铸造。
 const APIPROXY_BASE = process.env.DSH_WEB_URL || 'http://127.0.0.1:3080'
-async function apiproxy(method, payload) {
+let connectionSvcRef = null
+let authedUrlCache = null
+let cookieCache = null
+
+async function mintCookie() {
+  if (!authedUrlCache && connectionSvcRef && typeof connectionSvcRef.authenticatedUrl === 'function') {
+    try { authedUrlCache = connectionSvcRef.authenticatedUrl(APIPROXY_BASE) } catch { authedUrlCache = null }
+  }
+  if (!authedUrlCache) return null
+  let setCookies = []
+  try {
+    const r = await fetch(authedUrlCache, { redirect: 'manual' })
+    setCookies = typeof r.headers.getSetCookie === 'function' ? r.headers.getSetCookie() : []
+  } catch { return null }
+  for (const sc of setCookies) {
+    const pair = String(sc).split(';')[0]
+    if (pair && pair.includes('=')) { cookieCache = pair; return cookieCache }
+  }
+  return null
+}
+
+async function apiproxyCall(methodSlash, request, cookie) {
   const rpcId = 'dshsync-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
-  const r = await fetch(APIPROXY_BASE + '/api/' + method, {
+  const r = await fetch(`${APIPROXY_BASE}/api/${methodSlash}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) },
+    body: JSON.stringify({ type: 'client-request', rpcId, method: methodSlash, payload: { args: { request } } }),
+  })
+  if (r.status === 401) return { unauthorized: true }
+  if (r.status === 404) return { notFound: true }
+  const j = await r.json().catch(() => ({}))
+  return { res: j.result, raw: JSON.stringify(j).slice(0, 200) }
+}
+
+// 0.1.1-rc.2 回退：点号端点 + 平铺 payload、无认证
+async function apiproxyLegacy(dotted, request) {
+  const rpcId = 'dshsync-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
+  const r = await fetch(`${APIPROXY_BASE}/api/${dotted}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: 'client-request', rpcId, method, payload }),
+    body: JSON.stringify({ type: 'client-request', rpcId, method: dotted, payload: request }),
   })
   const j = await r.json().catch(() => ({}))
-  const res = j.result
-  if (!res || !res.ok) throw new Error('apiproxy ' + method + ' 失败: ' + JSON.stringify(j).slice(0, 200))
+  return j.result
+}
+
+async function apiproxy(methodSlash, request) {
+  let out = await apiproxyCall(methodSlash, request, cookieCache)
+  if (out.unauthorized) out = await apiproxyCall(methodSlash, request, await mintCookie())
+  if (out.unauthorized) throw new Error(`apiproxy ${methodSlash}: dsh web 认证失败（无法铸造 BrowserAuth cookie；需要 dsh ≥0.1.2 的 connection.authenticatedUrl）`)
+  if (out.notFound) {
+    const res = await apiproxyLegacy(methodSlash.replace('/', '.'), request)
+    if (!res || !res.ok) throw new Error(`apiproxy ${methodSlash} 失败: ` + JSON.stringify(res || out.raw).slice(0, 200))
+    return res.value
+  }
+  const res = out.res
+  if (!res || !res.ok) throw new Error(`apiproxy ${methodSlash} 失败: ` + JSON.stringify((res && res.error) || out.raw || {}).slice(0, 200))
   return res.value
 }
 
@@ -651,20 +747,31 @@ async function runAgentViaApiproxy({ prompt, dir, job, sessions, logger, token }
   // token 经 prompt 内联（{{token}}）--apiproxy 主对话级 session 的 bash 是 host-plane
   // executor，不继承 dsh web 进程的 process.env，故不能像 headless spawn 那样 env 注入
   try {
-    // 1. 创建主对话级 session（有 bash）+ 发 prompt
-    const created = await apiproxy('session.create', { cwd: dir })
+    // 1. 创建主对话级 session（有 bash）+ 发 prompt（0.1.2-rc.1：斜杠端点 + args 包裹）
+    const created = await apiproxy('session/create', { cwd: dir })
     const sessionId = created && created.sessionId
-    if (!sessionId) throw new Error('session.create 未返回 sessionId')
+    if (!sessionId) throw new Error('session/create 未返回 sessionId')
     job.sessionId = sessionId
-    await apiproxy('session.prompt', { sessionId, mode: 'queue', content: [{ type: 'text', text: prompt }] })
-    // 2. events 泵：ctx.sessions.get(sessionId) 同进程读活会话 events，300ms 取新
+    await apiproxy('session/prompt', {
+      requestId: 'dshsync-' + randomUUID(),
+      sessionId,
+      mode: 'queue',
+      content: [{ type: 'text', text: prompt }],
+    })
+    // 2. events 泵：ctx.sessions.get(sessionId) 同进程读活会话 events，300ms 取新。
+    //    优先 snapshotEvents()（事件 spill 后 .events 可能非数组，参考 dsh-session-title）
     let session
     try { session = sessions.get(sessionId) } catch (e) { throw new Error('ctx.sessions.get(' + sessionId + ') 失败: ' + (e && e.message)) }
     const seen = new Set()
     const liveLine = (text) => { job.output = (job.output + text).slice(-CONFLICT_RUN_OUTPUT_CAP) }
     let finished = false
     const pump = () => {
-      const evs = (session && Array.isArray(session.events)) ? session.events : []
+      let evs = []
+      try {
+        if (session && typeof session.snapshotEvents === 'function') evs = session.snapshotEvents() || []
+        else if (session && Array.isArray(session.events)) evs = session.events
+      } catch { evs = [] }
+      if (!Array.isArray(evs)) evs = []
       for (const ev of evs) {
         const seq = ev.seq
         if (seq != null && seen.has(seq)) continue
@@ -703,19 +810,22 @@ async function runAgentViaApiproxy({ prompt, dir, job, sessions, logger, token }
     job.status = finished ? 'done' : 'error'
     job.code = finished ? 0 : 1
     if (!finished) job.output += '\n[超时未完成]'
-  } finally {}
+  } finally {
+    if (typeof job.onFinish === 'function') { try { job.onFinish() } catch {} }
+  }
   return job
 }
 
-function createAgentRunJob({ prompt, dir, jobs, logger, sessions, token }) {
+function createAgentRunJob({ prompt, dir, jobs, logger, sessions, token, onFinish }) {
   const id = 'ag' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
-  const job = { id, status: 'running', startedAt: new Date().toISOString(), dir, output: '', code: null }
+  const job = { id, status: 'running', startedAt: new Date().toISOString(), dir, output: '', code: null, onFinish }
   jobs.set(id, job)
   // 走 apiproxy 创建主对话级 session（standard preset + dsh-base 全工具，含 bash），
   // 不是 agents.create 子 agent（精简无 bash）。token 注入 prompt，events 经 ctx.sessions.get 流式读。
   if (!sessions || typeof sessions.get !== 'function') {
     job.status = 'error'
     job.output = 'sessions 服务不可用（动态 ctx.inject 失败）'
+    if (typeof onFinish === 'function') { try { onFinish() } catch {} }
     return job
   }
   runAgentViaApiproxy({ prompt, dir, job, sessions, logger, token })
@@ -726,7 +836,10 @@ function createAgentRunJob({ prompt, dir, jobs, logger, sessions, token }) {
 module.exports = {
   name: 'dsh-sync',
   inject: ['webServer', 'settings'],
-  __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, substituteParams },
+  __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, substituteParams,
+    // apiproxy（导出供测试：mock fetch 驱动 wire 形态回归）
+    apiproxy, apiproxyCall, apiproxyLegacy, mintCookie,
+    __setConnection(svc) { connectionSvcRef = svc }, __resetApiproxyCache() { authedUrlCache = null; cookieCache = null } },
 
   apply(ctx, config = {}) {
     const dh = dshHome()
@@ -792,7 +905,11 @@ module.exports = {
 
     // ── Sync run: lock → push → pull → save ──
     let syncRun = null
-    const runSync = async () => {
+    // 自动对齐去重：同一批 bothModified 文件 30 分钟内只自动跑一次，防止 agent
+    // 解决失败时随 autoSync 无限重试
+    const ALIGN_COOLDOWN_MS = 30 * 60 * 1000
+    const alignState = { active: false, lastSig: '', lastAt: 0 }
+    const runSync = async ({ autoAlign = true } = {}) => {
       if (syncRun !== null) return syncRun
       syncRun = (async () => {
         await stateLoaded
@@ -808,11 +925,25 @@ module.exports = {
           // reconcile first: pull remote-only/untouched changes into live so
           // the full-snapshot push below never deletes another replica's adds
           result.reconcile = await reconcileRemote(eff.gitBinary, eff, ctx2).catch(e => { result.reconcileError = String(e && e.message); return null })
-          result.push = await runPush(eff.gitBinary, eff, ctx2).catch(e => { result.pushError = String(e && e.message); return null })
+          const both = (result.reconcile && Array.isArray(result.reconcile.bothModified)) ? result.reconcile.bothModified : []
+          // 双方都改过的文件不随快照推送（preserve）：远端版本留在 main，本机版本留在
+          // live，等 AI 智能对齐做语义合并——不再静默覆盖
+          result.push = await runPush(eff.gitBinary, eff, { ...ctx2, preserve: both.map(f => f.shadowPath) }).catch(e => { result.pushError = String(e && e.message); return null })
           result.pull = await runPull(eff.gitBinary, eff, ctx2).catch(e => { result.pullError = String(e && e.message); return null })
           state.lastSyncAt = new Date().toISOString()
           state.lastResult = { ...result, at: state.lastSyncAt, durationMs: Date.now() - started }
           await saveState()
+          // conflictMode=ai：检测到双方改动 → 自动触发 AI 智能对齐（后台 job，
+          // 会话内可追问；agent 合并完 live 文件后自己会 curl /dsh-sync/api/sync 推送）
+          if (autoAlign && eff.conflictMode === 'ai' && both.length > 0 && !alignState.active) {
+            const sig = both.map(f => f.shadowPath).sort().join('|')
+            if (sig !== alignState.lastSig || Date.now() - alignState.lastAt > ALIGN_COOLDOWN_MS) {
+              alignState.lastSig = sig
+              alignState.lastAt = Date.now()
+              const startedJob = await startAlignJob(eff, both)
+              if (startedJob) result.align = { jobId: startedJob.id, bothModified: both.map(f => f.shadowPath) }
+            }
+          }
         } finally { release() }
         return result
       })().finally(() => { syncRun = null })
@@ -832,6 +963,39 @@ module.exports = {
         ctx.inject(['sessions'], (svcs) => { sessionsSvc = svcs && svcs.sessions })
       }
     } catch {}
+    // 动态注入 connection 服务：0.1.2-rc.1 起 /api 需要 BrowserAuth cookie，
+    // 由 connection.authenticatedUrl 铸造（缺失时回退 0.1.1 无认证形态）
+    try {
+      if (ctx.inject && typeof ctx.inject === 'function') {
+        ctx.inject(['connection'], (svcs) => { connectionSvcRef = svcs && svcs.connection })
+      }
+    } catch {}
+
+    // AI 智能对齐 job（手动按钮 /align/run 与自动对齐共用）：先建备份目录，再创建
+    // 主对话级 agent session 语义合并 bothModified 文件
+    const startAlignJob = async (eff, both) => {
+      const baseCommit = state.lastSyncedCommit   // 双方分叉的共同基线（reconcile 前）
+      const backupDir = join(syncDir, 'align-backups', new Date().toISOString().replace(/[:.]/g, '-'))
+      await fsP.mkdir(backupDir, { recursive: true })
+      const fileList = both.length
+        ? both.map((f, i) => `${i + 1}. ${f.shadowPath}（本机：${displayPath(f.livePath)}）`).join('\n')
+        : '（无——确定性同步已处理全部差异）'
+      const roots = defaultRoots()
+      const prompt = substituteParams(ALIGN_PROMPT_ZH, {
+        shadowDir: repoDir,
+        skillsDsh: roots.dshSkills, skillsAgents: roots.agentsSkills,
+        sessions: roots.sessions, settingsFile: roots.settingsFile, profiles: roots.profiles,
+        backupDir, apiBase: APIPROXY_BASE, token: eff.token,
+        fileCount: both.length, fileList,
+        lastSynced: baseCommit || '（无共同基线，仓库首次同步）',
+      })
+      alignState.active = true
+      const job = createAgentRunJob({
+        prompt, dir: repoDir, jobs: alignRunJobs, logger: ctx.logger, sessions: sessionsSvc, token: eff.token,
+        onFinish: () => { alignState.active = false },
+      })
+      return job
+    }
 
     // ── Startup + periodic auto-sync ──
     ctx.effect(() => {
@@ -877,6 +1041,10 @@ module.exports = {
               syncing: syncRun !== null,
               pendingConflict: state.lastResult && state.lastResult.push && state.lastResult.push.conflict === true
                 ? { branch: state.lastPushedBranch, prNumber: state.lastPrNumber } : null,
+              bothModifiedPending: (state.lastResult && state.lastResult.reconcile && Array.isArray(state.lastResult.reconcile.bothModified))
+                ? state.lastResult.reconcile.bothModified.map(f => f.shadowPath) : [],
+              settingsPreserved: !!(state.lastResult && state.lastResult.push && state.lastResult.push.settingsPreserved),
+              alignRunning: alignState.active,
             })
             return
           }
@@ -946,36 +1114,21 @@ module.exports = {
           }
 
           // POST /dsh-sync/api/align/run → AI 智能对齐：先跑一次确定性同步
-          // （远端新增自动回填），再把两边都改过的文件交 agent 语义合并
+          // （远端新增自动回填、bothModified 不覆盖），再把两边都改过的文件交
+          // agent 语义合并
           if (req.method === 'POST' && apiPath.endsWith('/dsh-sync/api/align/run')) {
             await stateLoaded
             const eff = syncSettings()
             if (!eff.repoUrl || !eff.token) { sendJson(res, 400, { error: '未配置仓库或令牌' }); return }
-            const baseCommit = state.lastSyncedCommit   // 双方分叉的共同基线（reconcile 前）
             let syncResult = null
-            try { syncResult = await runSync() }
+            try { syncResult = await runSync({ autoAlign: false }) }
             catch (e) { sendJson(res, 400, { error: '同步预检失败：' + String(e && e.message || e) }); return }
             const rec = syncResult && syncResult.reconcile
             const both = (rec && Array.isArray(rec.bothModified)) ? rec.bothModified : []
-            const fileList = both.length
-              ? both.map((f, i) => `${i + 1}. ${f.shadowPath}（本机：${displayPath(f.livePath)}）`).join('\n')
-              : '（无——确定性同步已处理全部差异）'
-            const roots = defaultRoots()
-            const backupDir = join(syncDir, 'align-backups', new Date().toISOString().replace(/[:.]/g, '-'))
-            await fsP.mkdir(backupDir, { recursive: true })
-            const prompt = substituteParams(ALIGN_PROMPT_ZH, {
-              shadowDir: repoDir,
-              skillsDsh: roots.dshSkills, skillsAgents: roots.agentsSkills,
-              sessions: roots.sessions, settingsFile: roots.settingsFile, profiles: roots.profiles,
-              backupDir, apiBase: APIPROXY_BASE, token: eff.token,
-              fileCount: both.length, fileList,
-              lastSynced: baseCommit || '（无共同基线，仓库首次同步）',
-            })
-            const job = createAgentRunJob({ prompt, dir: repoDir, jobs: alignRunJobs, logger: ctx.logger, sessions: sessionsSvc, token: eff.token })
+            const job = await startAlignJob(eff, both)
             sendJson(res, 202, {
               jobId: job.id, status: job.status,
               bothModified: both.map(f => f.shadowPath),
-              backupDir: displayPath(backupDir),
               reconcile: rec ? { applied: rec.applied, bothModified: rec.bothModified.length, remoteDeleted: rec.remoteDeleted } : null,
             })
             return
@@ -987,6 +1140,46 @@ module.exports = {
             const job = alignRunJobs.get(id)
             if (job === undefined) { sendJson(res, 404, { error: 'job not found' }); return }
             sendJson(res, 200, { ...job, output: (job.output || '').slice(-32 * 1024) })
+            return
+          }
+
+          // POST /dsh-sync/api/prune-branches → 清理已合并的 sync/* 遗留分支。
+          // squash 合并后分支 tip 不在 main 历史里，merge-base 判不了，改用
+          // 「已合并 PR 的 head 分支名」集合来判定
+          if (req.method === 'POST' && apiPath.endsWith('/dsh-sync/api/prune-branches')) {
+            await stateLoaded
+            const eff = syncSettings()
+            if (!eff.repoUrl || !eff.token) { sendJson(res, 400, { error: '未配置仓库或令牌' }); return }
+            const parsed = parseRepoUrl(eff.repoUrl)
+            if (!parsed) { sendJson(res, 400, { error: '仅支持 GitCode 仓库' }); return }
+            const hasShadow = await fsP.access(join(repoDir, '.git')).then(() => true).catch(() => false)
+            if (!hasShadow) { sendJson(res, 400, { error: '影子仓库未初始化，先同步一次' }); return }
+            const remote = authedUrl(eff.repoUrl, eff.token)
+            try { await gitExec(eff.gitBinary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
+              sendJson(res, 400, { error: 'fetch 失败：' + String(e && e.message || e) }); return
+            }
+            // 收集已合并 PR 的 head 分支（翻页直到取完，上限 20 页 × 100）
+            const mergedHeads = new Set()
+            for (let page = 1; page <= 20; page++) {
+              const r = await gitcodeRequest(eff.token, 'GET', `/repos/${parsed.owner}/${parsed.repo}/pulls?state=merged&per_page=100&page=${page}`)
+              if (!r.ok || !Array.isArray(r.json) || r.json.length === 0) break
+              for (const pr of r.json) { if (pr.head && pr.head.ref) mergedHeads.add(pr.head.ref) }
+              if (r.json.length < 100) break
+            }
+            const ls = await gitExec(eff.gitBinary, ['ls-remote', '--heads', remote, 'refs/heads/sync/*'], repoDir).catch(() => '')
+            const refs = ls.split(/\r?\n/).map(l => l.trim()).filter(Boolean).map(l => {
+              const [sha, ref] = l.split(/\t/)
+              return { sha, branch: String(ref || '').replace('refs/heads/', '') }
+            }).filter(x => x.branch)
+            const deleted = [], kept = [], errors = []
+            for (const { branch } of refs) {
+              if (!mergedHeads.has(branch)) { kept.push(branch); continue }
+              try {
+                await gitExec(eff.gitBinary, ['push', remote, '--delete', branch], repoDir)
+                deleted.push(branch)
+              } catch (e) { errors.push(`${branch}: ${String(e && e.message || e).slice(0, 120)}`) }
+            }
+            sendJson(res, 200, { deleted, kept, errors, scanned: refs.length })
             return
           }
 
