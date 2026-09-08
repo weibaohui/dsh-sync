@@ -91,10 +91,20 @@ test('mirrorLiveToShadow + resolveLivePath round-trip', async () => {
     agentsLock: join(live, 'nope-lock'), sessions: join(live, 'nope-s'),
     settingsFile: join(live, 'settings.yaml'), profiles: join(live, 'nope-p'),
   }
-  const spec = I.syncSpec({ syncSkills: true, syncSessions: false, syncSettings: true, syncPlugins: false }, roots)
+  const spec = I.syncSpec({ syncSkills: true, syncSessions: false, syncSettings: true, syncPlugins: false, settingsStrategy: 'union' }, roots)
   await I.mirrorLiveToShadow(spec, shadow)
   assert.equal(fs.readFileSync(join(shadow, 'skills', 'dsh', 'foo', 'SKILL.md'), 'utf8'), '# foo')
   assert.equal(fs.readFileSync(join(shadow, 'settings', 'settings.yaml'), 'utf8'), 'k: v')
+  // backup 策略：写入 backup/<instanceId>/ 前缀，strategyForPath 可查
+  const bspec = I.syncSpec({ syncSkills: true, syncSessions: false, syncSettings: true, syncPlugins: false, settingsStrategy: 'backup', skillsStrategy: 'backup' }, roots, 'inst-9')
+  assert.equal(bspec[0].strategy, 'backup')
+  assert.equal(bspec[1].sources[0].to, 'backup/inst-9/settings/settings.yaml')
+  assert.equal(I.strategyForPath(bspec, 'backup/inst-9/skills/dsh/foo/SKILL.md'), 'backup')
+  assert.equal(I.strategyForPath(spec, 'skills/dsh/foo/SKILL.md'), 'union')
+  assert.equal(I.strategyForPath(spec, 'outside/path'), undefined)
+  const bshadow = join(tmp, 'bshadow')
+  await I.mirrorLiveToShadow(bspec, bshadow)
+  assert.equal(fs.readFileSync(join(bshadow, 'backup', 'inst-9', 'settings', 'settings.yaml'), 'utf8'), 'k: v')
   // reverse-resolve
   assert.equal(I.resolveLivePath(spec, 'skills/dsh/foo/SKILL.md'), join(live, 'skills', 'foo', 'SKILL.md'))
   assert.equal(I.resolveLivePath(spec, 'settings/settings.yaml'), join(live, 'settings.yaml'))
@@ -179,7 +189,7 @@ test('runPush: mirrors live → branch → PR → merge (mocked REST)', async ()
     if (/\/pulls\/1\/merge$/.test(u) && method === 'PUT') return mk({}, 200)
     return mk({ message: 'unmocked ' + u }, 404)
   }
-  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', syncSkills: true, syncSessions: false, syncSettings: true, syncPlugins: false, token: '' }
+  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', syncSkills: true, syncSessions: false, syncSettings: true, syncPlugins: false, settingsStrategy: 'union', token: '' }
   const state = { instanceId: 'testhost-abc12345' }
   try {
     const result = await I.runPush('git', eff, {
@@ -237,7 +247,7 @@ test('reconcileRemote: pulls remote-only adds into live, never overwrites local 
     settingsFile: join(live, '.dsh', 'settings.yaml'),
     profiles: join(live, '.nope-p'),
   }
-  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', syncSkills: true, syncSessions: false, syncSettings: true, syncPlugins: false, token: '' }
+  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', syncSkills: true, syncSessions: false, syncSettings: true, syncPlugins: false, settingsStrategy: 'union', token: '' }
   const state = { instanceId: 'testhost-rec' }
   try {
     // 1. shadow clone + baseline = seed commit
@@ -302,7 +312,7 @@ test('runPush preserve: both-modified files keep the remote version on the branc
     settingsFile: join(live, '.dsh', 'settings.yaml'),
     profiles: join(live, '.nope-p'),
   }
-  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', syncSkills: true, syncSessions: false, syncSettings: true, syncPlugins: false, token: '' }
+  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', syncSkills: true, syncSessions: false, syncSettings: true, syncPlugins: false, settingsStrategy: 'union', token: '' }
   const state = { instanceId: 'testhost-pres' }
   try {
     await I.ensureShadowRepo('git', eff, repoDir)
@@ -364,7 +374,7 @@ test('runPush first join: remote-only files kept, differing settings.yaml protec
     settingsFile: join(live, '.dsh', 'settings.yaml'),
     profiles: join(live, '.nope-p'),
   }
-  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', syncSkills: true, syncSessions: false, syncSettings: true, syncPlugins: false, token: '' }
+  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', syncSkills: true, syncSessions: false, syncSettings: true, syncPlugins: false, settingsStrategy: 'union', token: '' }
   const state = { instanceId: 'testhost-join' }   // no lastSyncedCommit → first join
   try {
     const push = await I.runPush('git', eff, { repoDir, instanceId: state.instanceId, state, logger: { warn: () => {} }, roots })
@@ -455,7 +465,7 @@ test('reconcileRemote: existing plugin manifest kept, new plugin files applied',
     settingsFile: join(live, '.nope-settings'),
     profiles: join(live, '.dsh', 'profiles'),
   }
-  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', syncSkills: true, syncSessions: false, syncSettings: false, syncPlugins: true, token: '' }
+  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', syncSkills: true, syncSessions: false, syncSettings: false, syncPlugins: true, pluginsStrategy: 'union', token: '' }
   const state = { instanceId: 'testhost-plug' }
   try {
     await I.ensureShadowRepo('git', eff, repoDir)
@@ -544,6 +554,125 @@ test('reconcile keeps per-file baseline for unresolved bothModified across syncs
     await I.runPush('git', eff, { repoDir, instanceId: state.instanceId, state, logger: { warn: () => {} }, roots })
     const merged = await new Promise((res, rej) => execFile('git', ['show', `${state.lastPushedBranch}:skills/dsh/x/SKILL.md`], { cwd: repoDir }, (e, o) => e ? rej(e) : res(String(o))))
     assert.equal(merged, 'base\nlocal edit\nremote edit\n', 'merged version reaches the push branch')
+  } finally {
+    await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {})
+  }
+})
+
+// ── Per-group strategies: local / remote / backup behavior ──────────────
+
+const STRAT_ROOTS = (live) => ({
+  dshSkills: join(live, '.dsh', 'skills'),
+  agentsSkills: join(live, '.nope-agents'),
+  agentsLock: join(live, '.nope-lock'),
+  sessions: join(live, '.nope-s'),
+  settingsFile: join(live, '.nope-settings'),
+  profiles: join(live, '.nope-p'),
+})
+const mkRepo = async (tmp) => {
+  const bareRepo = join(tmp, 'remote.git')
+  await sh(['init', '--bare', '-b', 'main', bareRepo])
+  const seed = join(tmp, 'seed')
+  await fsp.mkdir(seed, { recursive: true })
+  await fsp.writeFile(join(seed, '.gitattributes'), '*.jsonl merge=union\n')
+  await fsp.mkdir(join(seed, 'skills', 'dsh', 'x'), { recursive: true })
+  await fsp.writeFile(join(seed, 'skills', 'dsh', 'x', 'SKILL.md'), 'base\n')
+  await sh(['init', '-b', 'main'], seed)
+  await gitNoUser(['add', '-A'], seed)
+  await gitNoUser(['commit', '-m', 'seed'], seed)
+  await sh(['push', bareRepo, 'main'], seed)
+  return bareRepo
+}
+
+test('strategy local: remote changes never touch live, no conflict bookkeeping', async () => {
+  const tmp = await mkdtemp()
+  const bareRepo = await mkRepo(tmp)
+  const repoDir = join(tmp, 'repo')
+  const live = join(tmp, 'live')
+  await fsp.mkdir(join(live, '.dsh', 'skills', 'x'), { recursive: true })
+  await fsp.writeFile(join(live, '.dsh', 'skills', 'x', 'SKILL.md'), 'base\nlocal edit\n')
+  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', syncSkills: true, syncSessions: false, syncSettings: false, syncPlugins: false, skillsStrategy: 'local', token: '' }
+  const state = { instanceId: 'testhost-loc' }
+  try {
+    await I.ensureShadowRepo('git', eff, repoDir)
+    await sh(['fetch', bareRepo, 'main'], repoDir)
+    await sh(['checkout', 'main'], repoDir).catch(() => {})
+    await sh(['reset', '--hard', 'FETCH_HEAD'], repoDir)
+    state.lastSyncedCommit = await I.gitCurrentCommit('git', repoDir)
+    const peer = join(tmp, 'peer')
+    await sh(['clone', bareRepo, peer])
+    await fsp.writeFile(join(peer, 'skills', 'dsh', 'x', 'SKILL.md'), 'base\nremote edit\n')
+    await gitNoUser(['add', '-A'], peer)
+    await gitNoUser(['commit', '-m', 'peer edits x'], peer)
+    await sh(['push', bareRepo, 'main'], peer)
+    const rec = await I.reconcileRemote('git', eff, { repoDir, state, logger: { warn: () => {} }, roots: STRAT_ROOTS(live) })
+    assert.equal(rec.bothModified.length, 0, 'local strategy: no bothModified')
+    assert.equal(rec.applied.length, 0, 'local strategy: nothing applied')
+    assert.equal(fs.readFileSync(join(live, '.dsh', 'skills', 'x', 'SKILL.md'), 'utf8'), 'base\nlocal edit\n', 'live untouched')
+    assert.equal(JSON.stringify(state.pendingBoth), '{}', 'no conflict bookkeeping for local-wins')
+  } finally {
+    await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {})
+  }
+})
+
+test('strategy remote: local edits overwritten, deletions mirrored, group not pushed', async () => {
+  const tmp = await mkdtemp()
+  const bareRepo = await mkRepo(tmp)
+  const repoDir = join(tmp, 'repo')
+  const live = join(tmp, 'live')
+  await fsp.mkdir(join(live, '.dsh', 'skills', 'x'), { recursive: true })
+  await fsp.writeFile(join(live, '.dsh', 'skills', 'x', 'SKILL.md'), 'base\nlocal edit wins? no\n')
+  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', syncSkills: true, syncSessions: false, syncSettings: false, syncPlugins: false, skillsStrategy: 'remote', token: '' }
+  const state = { instanceId: 'testhost-rem' }
+  try {
+    await I.ensureShadowRepo('git', eff, repoDir)
+    await sh(['fetch', bareRepo, 'main'], repoDir)
+    await sh(['checkout', 'main'], repoDir).catch(() => {})
+    await sh(['reset', '--hard', 'FETCH_HEAD'], repoDir)
+    state.lastSyncedCommit = await I.gitCurrentCommit('git', repoDir)
+    // peer edits x AND deletes it, in two commits; also add y for the not-pushed check
+    const peer = join(tmp, 'peer')
+    await sh(['clone', bareRepo, peer])
+    await fsp.writeFile(join(peer, 'skills', 'dsh', 'x', 'SKILL.md'), 'base\nremote edit\n')
+    await gitNoUser(['add', '-A'], peer)
+    await gitNoUser(['commit', '-m', 'peer edits x'], peer)
+    await sh(['push', bareRepo, 'main'], peer)
+    const rec1 = await I.reconcileRemote('git', eff, { repoDir, state, logger: { warn: () => {} }, roots: STRAT_ROOTS(live) })
+    assert.equal(rec1.applied.length, 1, 'remote strategy overwrites local edit')
+    assert.equal(fs.readFileSync(join(live, '.dsh', 'skills', 'x', 'SKILL.md'), 'utf8'), 'base\nremote edit\n', 'remote wins')
+    // push must NOT carry the group (local is a read-only mirror)
+    await fsp.writeFile(join(live, '.dsh', 'skills', 'x', 'SKILL.md'), 'base\nlocal should not push\n')
+    const push = await I.runPush('git', eff, { repoDir, instanceId: state.instanceId, state, logger: { warn: () => {} }, roots: STRAT_ROOTS(live) })
+    assert.equal(push.nothingToCommit, true, 'remote-strategy group content is never pushed (nothing else to commit)')
+    // peer deletes x → live file removed too
+    await fsp.rm(join(peer, 'skills', 'dsh', 'x', 'SKILL.md'))
+    await gitNoUser(['add', '-A'], peer)
+    await gitNoUser(['commit', '-m', 'peer deletes x'], peer)
+    await sh(['push', bareRepo, 'main'], peer)
+    await I.reconcileRemote('git', eff, { repoDir, state, logger: { warn: () => {} }, roots: STRAT_ROOTS(live) })
+    assert.ok(!fs.existsSync(join(live, '.dsh', 'skills', 'x', 'SKILL.md')), 'deletion mirrored under remote-wins')
+  } finally {
+    await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {})
+  }
+})
+
+test('strategy backup: push lands in backup/<instanceId>/, never overwrites shared tree', async () => {
+  const tmp = await mkdtemp()
+  const bareRepo = await mkRepo(tmp)
+  const repoDir = join(tmp, 'repo')
+  const live = join(tmp, 'live')
+  await fsp.mkdir(join(live, '.dsh', 'skills', 'own'), { recursive: true })
+  await fsp.writeFile(join(live, '.dsh', 'skills', 'own', 'SKILL.md'), '# my own skill\n')
+  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', syncSkills: true, syncSessions: false, syncSettings: false, syncPlugins: false, skillsStrategy: 'backup', token: '' }
+  const state = { instanceId: 'testhost-bk' }
+  try {
+    const push = await I.runPush('git', eff, { repoDir, instanceId: state.instanceId, state, logger: { warn: () => {} }, roots: STRAT_ROOTS(live) })
+    assert.equal(push.pushed, true)
+    const blob = await new Promise((res, rej) => execFile('git', ['show', `${state.lastPushedBranch}:backup/testhost-bk/skills/dsh/own/SKILL.md`], { cwd: repoDir }, (e, o) => e ? rej(e) : res(String(o))))
+    assert.ok(blob.includes('# my own skill'), 'own backup lands under backup/<instanceId>/')
+    // shared tree untouched: base file x still at its original content
+    const shared = await new Promise((res, rej) => execFile('git', ['show', `${state.lastPushedBranch}:skills/dsh/x/SKILL.md`], { cwd: repoDir }, (e, o) => e ? rej(e) : res(String(o))))
+    assert.equal(shared, 'base\n', 'shared tree not overwritten by backup strategy')
   } finally {
     await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {})
   }

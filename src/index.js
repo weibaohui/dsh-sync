@@ -68,7 +68,16 @@ const DEFAULT_SYNC_SETTINGS = {
   syncSessions: false,
   syncSettings: true,
   syncPlugins: true,
+  // 每组独立策略：'backup' 各机云上独立备份（写 backup/<instanceId>/，本地永不被
+  // 覆盖）| 'union' 并集同步（新增都收、逐文件三方、双方改动交 AI）| 'remote'
+  // 覆盖·远端为准（本地只读镜像，远端删本地也删）| 'local' 覆盖·本地为准（远端只是回显）
+  skillsStrategy: 'union',
+  sessionsStrategy: 'backup',
+  settingsStrategy: 'backup',
+  pluginsStrategy: 'backup',
 }
+
+const STRATEGY_VALUES = ['backup', 'union', 'remote', 'local']
 
 // ── Shared helpers (ported from skills-management so conventions match) ──
 
@@ -249,30 +258,35 @@ function defaultRoots() {
   }
 }
 
-function syncSpec(eff, roots = defaultRoots()) {
+function syncSpec(eff, roots = defaultRoots(), instanceId = 'instance') {
+  const backup = (to) => `backup/${instanceId}/${to}`
   const groups = []
+  const skillsStrategy = STRATEGY_VALUES.includes(eff.skillsStrategy) ? eff.skillsStrategy : 'union'
+  const sessionsStrategy = STRATEGY_VALUES.includes(eff.sessionsStrategy) ? eff.sessionsStrategy : 'backup'
+  const settingsStrategy = STRATEGY_VALUES.includes(eff.settingsStrategy) ? eff.settingsStrategy : 'backup'
+  const pluginsStrategy = STRATEGY_VALUES.includes(eff.pluginsStrategy) ? eff.pluginsStrategy : 'backup'
   if (eff.syncSkills) groups.push({
-    name: 'skills',
+    name: 'skills', strategy: skillsStrategy,
     sources: [
-      { from: roots.dshSkills, to: 'skills/dsh' },
+      { from: roots.dshSkills, to: skillsStrategy === 'backup' ? backup('skills/dsh') : 'skills/dsh' },
       // 软链解引用成实文件：跨机不能指望同一个 link target 存在
-      { from: roots.agentsSkills, to: 'skills/agents', followSymlinks: true },
-      { from: roots.agentsLock, to: 'skills/.skill-lock.json', file: true },
+      { from: roots.agentsSkills, to: skillsStrategy === 'backup' ? backup('skills/agents') : 'skills/agents', followSymlinks: true },
+      { from: roots.agentsLock, to: skillsStrategy === 'backup' ? backup('skills/.skill-lock.json') : 'skills/.skill-lock.json', file: true },
     ],
   })
   if (eff.syncSessions) groups.push({
-    name: 'sessions',
-    sources: [{ from: roots.sessions, to: 'sessions', excludeNames: new Set(['session_projcache.json']) }],
+    name: 'sessions', strategy: sessionsStrategy,
+    sources: [{ from: roots.sessions, to: sessionsStrategy === 'backup' ? backup('sessions') : 'sessions', excludeNames: new Set(['session_projcache.json']) }],
   })
   if (eff.syncSettings) groups.push({
-    name: 'settings',
+    name: 'settings', strategy: settingsStrategy,
     // 整文件同步、不脱敏——前提是私仓校验通过
-    sources: [{ from: roots.settingsFile, to: 'settings/settings.yaml', file: true }],
+    sources: [{ from: roots.settingsFile, to: settingsStrategy === 'backup' ? backup('settings/settings.yaml') : 'settings/settings.yaml', file: true }],
   })
   if (eff.syncPlugins) groups.push({
-    name: 'plugins',
+    name: 'plugins', strategy: pluginsStrategy,
     sources: [{
-      from: roots.profiles, to: 'plugins',
+      from: roots.profiles, to: pluginsStrategy === 'backup' ? backup('plugins') : 'plugins',
       // 只存声明：package.json / patch / 锁文件。node_modules 按机重装，
       // .dsh-market 是市场缓存，cordis.yml 是 loader 产物（可重建）
       includeFiles: new Set(['package.json', 'cordis.patch.yml', 'pnpm-lock.yaml', 'pnpm-workspace.yaml']),
@@ -281,6 +295,18 @@ function syncSpec(eff, roots = defaultRoots()) {
     }],
   })
   return groups
+}
+
+/** shadow 相对路径所属组的策略（不在任何组内 → undefined）。 */
+function strategyForPath(spec, shadowRel) {
+  const norm = shadowRel.split(sep).join('/')
+  for (const group of spec) {
+    for (const src of group.sources) {
+      const to = src.to.split(sep).join('/')
+      if (norm === to || norm.startsWith(to + '/')) return group.strategy
+    }
+  }
+  return undefined
 }
 
 async function copyTree(from, to, opts) {
@@ -376,7 +402,7 @@ async function ensureShadowRepo(binary, eff, repoDir) {
 
 async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots, preserve }) {
   const remote = await ensureShadowRepo(binary, eff, repoDir)
-  const spec = syncSpec(eff, roots)
+  const spec = syncSpec(eff, roots, instanceId)
   // 首次接入判定必须在任何基线推进之前读
   const firstJoin = !state.lastSyncedCommit
   let settingsPreserved = false
@@ -394,15 +420,19 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
   // detach onto base so the working tree reflects the canonical baseline
   await gitExec(binary, ['checkout', '--detach', baseRef], repoDir).catch(() => {})
   // 3. overlay live snapshot onto the baseline: shadow now = baseline + local deltas
-  await mirrorLiveToShadow(spec, repoDir)
+  // remote（覆盖·远端为准）组本地是只读镜像：不推送本机版本
+  await mirrorLiveToShadow(spec.filter(g => g.strategy !== 'remote'), repoDir)
 
   if (firstJoin && hasRemote) {
     // 首次接入 = 并集加入。全量快照覆盖会把"远端有、本机没有"的文件当作本地删除
     // 推出去（实测新机首推从 main 删掉另一台机器 1.3 万个文件）。没有共同基线时
     // 无法区分"本地删过"和"本地从来没有"，一律按后者处理：恢复远端独有文件。
+    // 自己的 backup/<instanceId>/ 前缀除外——备份就该镜像当前 live，陈旧备份不回魂。
+    const ownBackupPrefix = `backup/${instanceId}/`
     let deletedRaw = ''
     try { deletedRaw = await gitExec(binary, ['diff', '--name-only', '--diff-filter=D', 'FETCH_HEAD'], repoDir) } catch {}
     for (const p of deletedRaw.split(/\r?\n/).map(s => s.trim()).filter(Boolean)) {
+      if (p.startsWith(ownBackupPrefix)) continue
       await gitExec(binary, ['checkout', 'FETCH_HEAD', '--', p], repoDir).catch(() => {})
     }
     // settings.yaml 带各机凭证与模型配置：首次接入若与本机不同，整文件覆盖会在下次
@@ -489,7 +519,7 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
 
 async function runPull(binary, eff, { repoDir, state, logger, roots }) {
   const remote = authedUrl(eff.repoUrl, eff.token)
-  const spec = syncSpec(eff, roots)
+  const spec = syncSpec(eff, roots, state.instanceId)
   const lastSynced = state.lastSyncedCommit
   try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
     if (!/Could not find|doesn't exist|empty/i.test(String(e && e.message))) throw e
@@ -557,7 +587,7 @@ async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
   const fs = require('node:fs')
   try { await fs.promises.access(join(repoDir, '.git')) } catch { return { reconciled: false, noShadow: true } }
   const remote = authedUrl(eff.repoUrl, eff.token)
-  const spec = syncSpec(eff, roots)
+  const spec = syncSpec(eff, roots, state.instanceId)
   try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
     if (!/Could not find|doesn't exist|no such|empty/i.test(String(e && e.message))) throw e
     return { reconciled: false, empty: true }
@@ -586,10 +616,18 @@ async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
   for (const p of changed) {
     const livePath = resolveLivePath(spec, p)
     if (!livePath) continue
+    const strategy = strategyForPath(spec, p)
+    // backup（各机独立备份）与 local（覆盖·本地为准）：本地是权威，远端动向一概不理
+    if (strategy === 'backup' || strategy === 'local') {
+      delete state.pendingBoth[p]
+      continue
+    }
     let remoteBuf = null
     try { remoteBuf = await gitShowBuf(binary, `FETCH_HEAD:${p}`, repoDir) } catch { remoteBuf = null }
     if (remoteBuf === null) {
-      remoteDeleted.push(p)
+      // 远端为准：远端删了本地也删；其余策略远端删除从不镜像
+      if (strategy === 'remote') { try { await fsP.unlink(livePath); applied.push(p) } catch {} }
+      else remoteDeleted.push(p)
       delete state.pendingBoth[p]
       continue
     }
@@ -599,6 +637,12 @@ async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
     // package.json 覆盖本机 web profile 的 bundle 列表 → 宿主重启解析不到 bundle，
     // launchd crash loop）。本地没有的清单文件照常回填，新机器的清单以并集到来。
     if ((p === 'plugins' || p.startsWith('plugins/')) && liveBuf !== null) { localKept.push(p); continue }
+    // 覆盖·远端为准：无条件镜像远端（含本地改过的文件），不进冲突流程
+    if (strategy === 'remote') {
+      delete state.pendingBoth[p]
+      try { await atomicWriteFile(livePath, remoteBuf); applied.push(p) } catch {}
+      continue
+    }
     // 未解决文件的基线固定在首次发现冲突时的 commit，其余文件跟随 lastSynced
     const fileBase = state.pendingBoth[p] || lastSynced
     let baseBuf = null
@@ -886,7 +930,7 @@ function createAgentRunJob({ prompt, dir, jobs, logger, sessions, token, onFinis
 module.exports = {
   name: 'dsh-sync',
   inject: ['webServer', 'settings'],
-  __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, substituteParams,
+  __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, substituteParams, strategyForPath, STRATEGY_VALUES,
     // apiproxy（导出供测试：mock fetch 驱动 wire 形态回归）
     apiproxy, apiproxyCall, apiproxyLegacy, mintCookie,
     __setConnection(svc) { connectionSvcRef = svc }, __resetApiproxyCache() { authedUrlCache = null; cookieCache = null } },
@@ -924,6 +968,10 @@ module.exports = {
           syncSessions: Schema.boolean(),
           syncSettings: Schema.boolean(),
           syncPlugins: Schema.boolean(),
+          skillsStrategy: Schema.string(),
+          sessionsStrategy: Schema.string(),
+          settingsStrategy: Schema.string(),
+          pluginsStrategy: Schema.string(),
           token: Schema.string(),
         }), { base: baseSettings() })
       } catch (e) { ctx.logger.warn(`dsh-sync: settings register: ${e && e.message}`) }
@@ -984,7 +1032,7 @@ module.exports = {
           const pendings = Object.keys(state.pendingBoth)
             .filter(p => !fresh.some(f => f.shadowPath === p))
             .map(p => {
-              const livePath = resolveLivePath(syncSpec(eff, defaultRoots()), p)
+              const livePath = resolveLivePath(syncSpec(eff, defaultRoots(), state.instanceId), p)
               return livePath ? { shadowPath: p, livePath, baseCommit: state.pendingBoth[p] } : null
             })
             .filter(Boolean)
@@ -1119,6 +1167,12 @@ module.exports = {
               intervalMinutes: eff.intervalMinutes, conflictMode: eff.conflictMode,
               syncSkills: eff.syncSkills, syncSessions: eff.syncSessions,
               syncSettings: eff.syncSettings, syncPlugins: eff.syncPlugins,
+              strategies: {
+                skills: STRATEGY_VALUES.includes(eff.skillsStrategy) ? eff.skillsStrategy : 'union',
+                sessions: STRATEGY_VALUES.includes(eff.sessionsStrategy) ? eff.sessionsStrategy : 'backup',
+                settings: STRATEGY_VALUES.includes(eff.settingsStrategy) ? eff.settingsStrategy : 'backup',
+                plugins: STRATEGY_VALUES.includes(eff.pluginsStrategy) ? eff.pluginsStrategy : 'backup',
+              },
               hasToken: typeof token === 'string' && token !== '',
               syncing: syncRun !== null,
               pendingConflict: state.lastResult && state.lastResult.push && state.lastResult.push.conflict === true
@@ -1146,6 +1200,9 @@ module.exports = {
             const patch = {}
             for (const key of ['repoUrl', 'branch', 'gitBinary', 'conflictMode']) {
               if (typeof body[key] === 'string' && body[key] !== '') patch[key] = body[key]
+            }
+            for (const key of ['skillsStrategy', 'sessionsStrategy', 'settingsStrategy', 'pluginsStrategy']) {
+              if (STRATEGY_VALUES.includes(body[key])) patch[key] = body[key]
             }
             for (const key of ['autoSync', 'syncOnStartup', 'syncSkills', 'syncSessions', 'syncSettings', 'syncPlugins']) {
               if (typeof body[key] === 'boolean') patch[key] = body[key]
@@ -1210,7 +1267,7 @@ module.exports = {
             const both = [...fresh, ...Object.keys(state.pendingBoth)
               .filter(p => !fresh.some(f => f.shadowPath === p))
               .map(p => {
-                const livePath = resolveLivePath(syncSpec(eff, defaultRoots()), p)
+                const livePath = resolveLivePath(syncSpec(eff, defaultRoots(), state.instanceId), p)
                 return livePath ? { shadowPath: p, livePath, baseCommit: state.pendingBoth[p] } : null
               })
               .filter(Boolean)]
