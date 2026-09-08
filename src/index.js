@@ -75,6 +75,9 @@ const DEFAULT_SYNC_SETTINGS = {
   sessionsStrategy: 'backup',
   settingsStrategy: 'backup',
   pluginsStrategy: 'backup',
+  snapshotSkills: false,      // 快照是否包含技能（体积大，默认只含 设置+插件清单）
+  snapshotAuto: true,         // 每天首个同步自动打一份本地快照（auto-<日期>）
+  snapshotLocalKeep: 30,      // 本地快照滚动保留份数（勾了云端的随时可从云端恢复）
 }
 
 const STRATEGY_VALUES = ['backup', 'union', 'remote', 'local']
@@ -681,6 +684,95 @@ async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
   return { reconciled: true, applied, bothModified, remoteDeleted, localKept, changed: changed.length }
 }
 
+// ── Snapshots: local-first, cloud only when explicitly checked ──────────
+//    快照优先落本地（~/.dsh/dsh-sync/snapshots/<名字>/，本地滚动窗口内真删除
+//    真释放），打快照时勾选「上传到云端」才写进 git（backup/<实例ID>/snapshots/，
+//    永久存档）。恢复时本地没有的从云端影子仓库取。
+
+/** 快照镜像 spec：快照范围与同步开关解耦（快照=机器状态备份，同步=跨机收敛）：
+ *  固定拍 设置+插件清单，skills 按 snapshotSkills 勾选，sessions 永远排除（体积
+ *  大头）。快照固定用共享规范布局（settings/settings.yaml 等），与各组当前策略
+ *  无关——恢复时按同样布局写回。 */
+function snapshotMirrorSpec(eff, roots, instanceId, name) {
+  const shared = {
+    syncSkills: true, syncSessions: false, syncSettings: true, syncPlugins: true,
+    skillsStrategy: 'union', sessionsStrategy: 'union', settingsStrategy: 'union', pluginsStrategy: 'union',
+  }
+  return syncSpec(shared, roots, instanceId)
+    .filter(g => g.name !== 'sessions' && (g.name !== 'skills' || eff.snapshotSkills === true))
+    .map(g => ({ ...g, sources: g.sources.map(s => ({ ...s, to: `snapshots/${name}/${s.to}` })) }))
+}
+
+function sanitizeSnapshotName(raw) {
+  const cleaned = String(raw || '').trim().replace(/[\\/:*?"<>|\s]+/g, '-').replace(/^[-.]+|[-.]+$/g, '').slice(0, 60)
+  return cleaned || ''
+}
+
+/** 本地快照滚动清理：按名字倒序保留 keep 份。手动命名且未上云的不自动删
+ *  （用户显式产物）；其余（auto- / pre-restore- / 已上云的）超窗即删。 */
+async function pruneLocalSnapshots(snapshotsDir, keep, cloudNames) {
+  let entries = []
+  try { entries = await fsP.readdir(snapshotsDir, { withFileTypes: true }) } catch { return [] }
+  const dirs = entries.filter(e => e.isDirectory()).map(e => e.name).sort().reverse()
+  const removed = []
+  for (let i = 0; i < dirs.length; i++) {
+    if (i < keep) continue
+    const manualUnclouded = !dirs[i].startsWith('auto-') && !dirs[i].startsWith('pre-restore-') && !(cloudNames || []).includes(dirs[i])
+    if (manualUnclouded) continue
+    try { await fsP.rm(join(snapshotsDir, dirs[i]), { recursive: true, force: true }); removed.push(dirs[i]) } catch {}
+  }
+  return removed
+}
+
+/** 勾选了云端：把本地快照目录写进影子仓库 backup/<实例ID>/snapshots/<名字>/
+ *  并走一次 分支 → PR → 合并（非 GitCode 远端退化为推分支）。 */
+async function promoteSnapshotToCloud(binary, eff, { repoDir, instanceId, state, logger }, snapName, srcDir) {
+  const remote = authedUrl(eff.repoUrl, eff.token)
+  try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
+    if (!/Could not find|doesn't exist|no such|empty/i.test(String(e && e.message))) throw e
+  }
+  const hasRemote = await gitExec(binary, ['rev-parse', '--verify', 'FETCH_HEAD'], repoDir).then(() => true).catch(() => false)
+  if (hasRemote) await gitExec(binary, ['checkout', '--detach', 'FETCH_HEAD'], repoDir).catch(() => {})
+  const dest = join(repoDir, 'backup', instanceId, 'snapshots', snapName)
+  await fsP.rm(dest, { recursive: true, force: true }).catch(() => {})
+  await copyTree(srcDir, dest, {})
+  const branch = `sync/${instanceId}/snap-${Date.now()}`
+  await gitExec(binary, ['checkout', '-b', branch], repoDir)
+  await gitExec(binary, ['add', '-A'], repoDir)
+  try {
+    await gitExec(binary, ['-c', 'user.name=dsh-sync', '-c', 'user.email=dsh-sync@local', 'commit', '-m', `snapshot ${instanceId} ${snapName}`], repoDir)
+  } catch {
+    return { promoted: false, nothingToCommit: true }
+  }
+  await gitExec(binary, ['push', remote, `HEAD:${branch}`], repoDir)
+  const parsed = parseRepoUrl(eff.repoUrl)
+  if (!parsed) {
+    // 非 GitCode 远端：推分支后把影子基线推进到 main（与 runPush 的 prSkipped 路径一致）
+    await gitExec(binary, ['fetch', remote, eff.branch], repoDir).catch(() => {})
+    await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
+    await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
+    state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
+    return { promoted: true, prSkipped: true, branch }
+  }
+  const prRes = await createPullRequest(eff.token, parsed.owner, parsed.repo, { head: branch, base: eff.branch, title: `dsh-sync snapshot ${instanceId} ${snapName}`, body: 'snapshot → cloud archive' })
+  if (!prRes.ok) throw new Error(`创建快照 PR 失败（HTTP ${prRes.status}）：${(prRes.json && prRes.json.message) || prRes.text.slice(0, 160)}`)
+  const prNumber = prRes.json && (prRes.json.number || prRes.json.id)
+  let merged = false
+  try {
+    const det = await getPullRequest(eff.token, parsed.owner, parsed.repo, prNumber)
+    if (det.ok && det.json && det.json.mergeable === true) {
+      const mr = await mergePullRequest(eff.token, parsed.owner, parsed.repo, prNumber, 'squash')
+      merged = !!mr.ok
+    }
+  } catch {}
+  if (merged) await gitExec(binary, ['push', remote, '--delete', branch], repoDir).catch(() => {})
+  await gitExec(binary, ['fetch', remote, eff.branch], repoDir).catch(() => {})
+  await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
+  await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
+  state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
+  return { promoted: true, merged, prNumber, branch }
+}
+
 // ── Conflict-resolution action button: in-process agent (same channel as
 //    skills-management share-run). The agent operates the shadow repo's git
 //    directly + merges the PR via REST. Only this step needs semantic
@@ -930,7 +1022,7 @@ function createAgentRunJob({ prompt, dir, jobs, logger, sessions, token, onFinis
 module.exports = {
   name: 'dsh-sync',
   inject: ['webServer', 'settings'],
-  __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, substituteParams, strategyForPath, STRATEGY_VALUES,
+  __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, substituteParams, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud,
     // apiproxy（导出供测试：mock fetch 驱动 wire 形态回归）
     apiproxy, apiproxyCall, apiproxyLegacy, mintCookie,
     __setConnection(svc) { connectionSvcRef = svc }, __resetApiproxyCache() { authedUrlCache = null; cookieCache = null } },
@@ -972,6 +1064,9 @@ module.exports = {
           sessionsStrategy: Schema.string(),
           settingsStrategy: Schema.string(),
           pluginsStrategy: Schema.string(),
+          snapshotSkills: Schema.boolean(),
+          snapshotAuto: Schema.boolean(),
+          snapshotLocalKeep: Schema.number(),
           token: Schema.string(),
         }), { base: baseSettings() })
       } catch (e) { ctx.logger.warn(`dsh-sync: settings register: ${e && e.message}`) }
@@ -985,7 +1080,7 @@ module.exports = {
     }
 
     // ── State (instanceId + lastSyncedCommit + lastResult) ──
-    let state = { instanceId: undefined, lastSyncedCommit: undefined, lastSyncAt: undefined, lastResult: undefined }
+    let state = { instanceId: undefined, lastSyncedCommit: undefined, lastSyncAt: undefined, lastResult: undefined, cloudSnapshots: [], lastAutoSnapshotDate: undefined }
     const stateLoaded = fsP.readFile(stateFile, 'utf8').then(raw => {
       try { Object.assign(state, JSON.parse(raw)) } catch {}
     }).catch(() => {})
@@ -999,6 +1094,13 @@ module.exports = {
     })
     const saveState = async () => {
       try { await fsP.mkdir(syncDir, { recursive: true }); await fsP.writeFile(stateFile, JSON.stringify(state, null, 2), { mode: 0o600 }) } catch {}
+    }
+
+    // 本地快照：把快照范围的 live 内容镜像到 ~/.dsh/dsh-sync/snapshots/<名字>/
+    const createLocalSnapshot = async (eff, name) => {
+      const spec = snapshotMirrorSpec(eff, defaultRoots(), state.instanceId, name)
+      await mirrorLiveToShadow(spec, syncDir)
+      return join(syncDir, 'snapshots', name)
     }
 
     // ── Sync run: lock → push → pull → save ──
@@ -1056,6 +1158,18 @@ module.exports = {
               if (startedJob) result.align = { jobId: startedJob.id, bothModified: both.map(f => f.shadowPath) }
             }
           }
+          // 每日自动快照（本地滚动，勾选云端才上云——自动快照只落本地）
+          if (eff.snapshotAuto !== false) {
+            const today = new Date().toISOString().slice(0, 10)
+            if (state.lastAutoSnapshotDate !== today) {
+              try {
+                await createLocalSnapshot(eff, `auto-${today}`)
+                state.lastAutoSnapshotDate = today
+                await saveState()
+              } catch (e) { ctx.logger.warn(`dsh-sync: auto snapshot: ${e && e.message}`) }
+            }
+          }
+          try { await pruneLocalSnapshots(join(syncDir, 'snapshots'), eff.snapshotLocalKeep || 30, state.cloudSnapshots) } catch {}
           state.lastResult = { ...result, at: state.lastSyncAt, durationMs: Date.now() - started }
           await saveState()
         } finally { release() }
@@ -1173,6 +1287,7 @@ module.exports = {
                 settings: STRATEGY_VALUES.includes(eff.settingsStrategy) ? eff.settingsStrategy : 'backup',
                 plugins: STRATEGY_VALUES.includes(eff.pluginsStrategy) ? eff.pluginsStrategy : 'backup',
               },
+              snapshot: { skills: eff.snapshotSkills === true, auto: eff.snapshotAuto !== false, localKeep: eff.snapshotLocalKeep || 30 },
               hasToken: typeof token === 'string' && token !== '',
               syncing: syncRun !== null,
               pendingConflict: state.lastResult && state.lastResult.push && state.lastResult.push.conflict === true
@@ -1204,6 +1319,10 @@ module.exports = {
             for (const key of ['skillsStrategy', 'sessionsStrategy', 'settingsStrategy', 'pluginsStrategy']) {
               if (STRATEGY_VALUES.includes(body[key])) patch[key] = body[key]
             }
+            for (const key of ['snapshotSkills', 'snapshotAuto']) {
+              if (typeof body[key] === 'boolean') patch[key] = body[key]
+            }
+            if (typeof body.snapshotLocalKeep === 'number' && body.snapshotLocalKeep >= 1) patch.snapshotLocalKeep = Math.floor(body.snapshotLocalKeep)
             for (const key of ['autoSync', 'syncOnStartup', 'syncSkills', 'syncSessions', 'syncSettings', 'syncPlugins']) {
               if (typeof body[key] === 'boolean') patch[key] = body[key]
             }
@@ -1326,6 +1445,102 @@ module.exports = {
               } catch (e) { errors.push(`${branch}: ${String(e && e.message || e).slice(0, 120)}`) }
             }
             sendJson(res, 200, { deleted, kept, errors, scanned: refs.length })
+            return
+          }
+
+          // POST /dsh-sync/api/snapshot/run {name?, cloud?} → 打快照；勾选 cloud 才上 git
+          if (req.method === 'POST' && apiPath.endsWith('/dsh-sync/api/snapshot/run')) {
+            const body = await readJsonBody(req)
+            await stateLoaded
+            const eff = syncSettings()
+            if (!eff.repoUrl || !eff.token) { sendJson(res, 400, { error: '未配置仓库或令牌' }); return }
+            let name = sanitizeSnapshotName(body.name)
+            if (!name) name = `manual-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}`
+            const dup = await fsP.access(join(syncDir, 'snapshots', name)).then(() => true).catch(() => false)
+            if (dup) name = `${name}-${Date.now()}`
+            const dir = await createLocalSnapshot(eff, name)
+            let promoted = false, promoteResult = null
+            if (body.cloud === true) {
+              const release = await acquireLock(lockFile)
+              if (release === null) { sendJson(res, 400, { error: '另一个同步进程正在运行，稍后再试' }); return }
+              try {
+                promoteResult = await promoteSnapshotToCloud(eff.gitBinary, eff, { repoDir, instanceId: state.instanceId, state, logger: ctx.logger }, name, dir)
+                promoted = promoteResult.promoted === true
+                if (promoted && !(state.cloudSnapshots || []).includes(name)) { state.cloudSnapshots.push(name); await saveState() }
+              } catch (e) { sendJson(res, 400, { error: String(e && e.message || e) }); return }
+              finally { release() }
+            }
+            const pruned = await pruneLocalSnapshots(join(syncDir, 'snapshots'), eff.snapshotLocalKeep || 30, state.cloudSnapshots).catch(() => [])
+            sendJson(res, 200, { name, promoted, promoteResult, pruned })
+            return
+          }
+
+          // GET /dsh-sync/api/snapshot/list → 本地快照 + 云端名单
+          if (req.method === 'GET' && apiPath.endsWith('/dsh-sync/api/snapshot/list')) {
+            await stateLoaded
+            const dir = join(syncDir, 'snapshots')
+            const local = []
+            try {
+              for (const ent of await fsP.readdir(dir, { withFileTypes: true })) {
+                if (!ent.isDirectory()) continue
+                let created = undefined
+                try { created = (await fsP.stat(join(dir, ent.name))).birthtime.toISOString() } catch {}
+                local.push({ name: ent.name, created, inCloud: (state.cloudSnapshots || []).includes(ent.name) })
+              }
+            } catch {}
+            local.sort((a, b) => b.name.localeCompare(a.name))
+            sendJson(res, 200, { local, cloud: state.cloudSnapshots || [] })
+            return
+          }
+
+          // POST /dsh-sync/api/snapshot/restore {name} → 恢复（先拍 pre-restore 安全快照）
+          if (req.method === 'POST' && apiPath.endsWith('/dsh-sync/api/snapshot/restore')) {
+            const body = await readJsonBody(req)
+            await stateLoaded
+            const eff = syncSettings()
+            if (!eff.repoUrl || !eff.token) { sendJson(res, 400, { error: '未配置仓库或令牌' }); return }
+            const name = sanitizeSnapshotName(body.name)
+            if (!name) { sendJson(res, 400, { error: '缺少快照名' }); return }
+            let srcDir = join(syncDir, 'snapshots', name)
+            const localExists = await fsP.access(srcDir).then(() => true).catch(() => false)
+            if (!localExists) {
+              if (!(state.cloudSnapshots || []).includes(name)) { sendJson(res, 404, { error: `本地与云端都没有快照 ${name}` }); return }
+              const release = await acquireLock(lockFile)
+              if (release === null) { sendJson(res, 400, { error: '另一个同步进程正在运行，稍后再试' }); return }
+              try {
+                const remote = authedUrl(eff.repoUrl, eff.token)
+                await gitExec(eff.gitBinary, ['fetch', remote, eff.branch], repoDir)
+                const cloudPath = `backup/${state.instanceId}/snapshots/${name}`
+                await gitExec(eff.gitBinary, ['checkout', 'FETCH_HEAD', '--', cloudPath], repoDir)
+                await copyTree(join(repoDir, cloudPath), srcDir, {})
+                await gitExec(eff.gitBinary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
+                if (!(state.cloudSnapshots || []).includes(name)) { state.cloudSnapshots.push(name); await saveState() }
+              } catch (e) { sendJson(res, 400, { error: String(e && e.message || e) }); return }
+              finally { release() }
+            }
+            // 恢复前给当前状态拍安全快照
+            const safetyName = `pre-restore-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}`
+            await createLocalSnapshot(eff, safetyName)
+            // 反向写回 live（快照里有哪些组就恢复哪些）
+            const spec = snapshotMirrorSpec(eff, defaultRoots(), state.instanceId, name)
+            const restored = []
+            for (const group of spec) {
+              for (const src of group.sources) {
+                const snapPath = join(syncDir, src.to)   // src.to 已含 snapshots/<名字>/ 前缀，快照根就是 syncDir
+                const have = await fsP.access(snapPath).then(() => true).catch(() => false)
+                if (!have) continue
+                if (src.file) {
+                  await fsP.mkdir(join(src.from, '..'), { recursive: true })
+                  await fsP.copyFile(snapPath, src.from)
+                } else {
+                  await copyTree(snapPath, src.from, { includeFiles: src.includeFiles, excludeDirs: src.excludeDirs, excludeNames: src.excludeNames, followSymlinks: src.followSymlinks })
+                }
+                if (!restored.includes(group.name)) restored.push(group.name)
+              }
+            }
+            await pruneLocalSnapshots(join(syncDir, 'snapshots'), eff.snapshotLocalKeep || 30, state.cloudSnapshots).catch(() => [])
+            runSync({ autoAlign: false }).catch(() => {})
+            sendJson(res, 200, { restored: restored, safetySnapshot: safetyName })
             return
           }
 
