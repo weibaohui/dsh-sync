@@ -426,3 +426,59 @@ test('apiproxy: BrowserAuth cookie dance, slash endpoint, args envelope, legacy 
     I.__setConnection(null)
   }
 })
+
+// ── Machine-owned plugin manifests: pull/reconcile never overwrite existing ──
+
+test('reconcileRemote: existing plugin manifest kept, new plugin files applied', async () => {
+  const tmp = await mkdtemp()
+  const bareRepo = join(tmp, 'remote.git')
+  const repoDir = join(tmp, 'repo')
+  const live = join(tmp, 'live')
+  await sh(['init', '--bare', '-b', 'main', bareRepo])
+  const seed = join(tmp, 'seed')
+  await fsp.mkdir(seed, { recursive: true })
+  await fsp.writeFile(join(seed, '.gitattributes'), '*.jsonl merge=union\n')
+  await sh(['init', '-b', 'main'], seed)
+  await gitNoUser(['add', '-A'], seed)
+  await gitNoUser(['commit', '-m', 'seed'], seed)
+  await sh(['push', bareRepo, 'main'], seed)
+  // live: own web profile manifest + own skill
+  await fsp.mkdir(join(live, '.dsh', 'skills', 'foo'), { recursive: true })
+  await fsp.mkdir(join(live, '.dsh', 'profiles', 'web'), { recursive: true })
+  await fsp.writeFile(join(live, '.dsh', 'skills', 'foo', 'SKILL.md'), '# foo')
+  await fsp.writeFile(join(live, '.dsh', 'profiles', 'web', 'package.json'), '{"bundles":["ours"]}')
+  const roots = {
+    dshSkills: join(live, '.dsh', 'skills'),
+    agentsSkills: join(live, '.nope-agents'),
+    agentsLock: join(live, '.nope-lock'),
+    sessions: join(live, '.nope-s'),
+    settingsFile: join(live, '.nope-settings'),
+    profiles: join(live, '.dsh', 'profiles'),
+  }
+  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', syncSkills: true, syncSessions: false, syncSettings: false, syncPlugins: true, token: '' }
+  const state = { instanceId: 'testhost-plug' }
+  try {
+    await I.ensureShadowRepo('git', eff, repoDir)
+    await sh(['fetch', bareRepo, 'main'], repoDir)
+    await sh(['checkout', 'main'], repoDir).catch(() => {})
+    await sh(['reset', '--hard', 'FETCH_HEAD'], repoDir)
+    state.lastSyncedCommit = await I.gitCurrentCommit('git', repoDir)
+    // peer (old plugin version) replaced web/package.json AND added a new profile dir
+    const peer = join(tmp, 'peer')
+    await sh(['clone', bareRepo, peer])
+    await fsp.mkdir(join(peer, 'plugins', 'web'), { recursive: true })
+    await fsp.mkdir(join(peer, 'plugins', 'their-extra'), { recursive: true })
+    await fsp.writeFile(join(peer, 'plugins', 'web', 'package.json'), '{"bundles":["theirs","dsh-at-file"]}')
+    await fsp.writeFile(join(peer, 'plugins', 'their-extra', 'package.json'), '{"bundles":["theirs-extra"]}')
+    await gitNoUser(['add', '-A'], peer)
+    await gitNoUser(['commit', '-m', 'peer swaps manifests'], peer)
+    await sh(['push', bareRepo, 'main'], peer)
+    const rec = await I.reconcileRemote('git', eff, { repoDir, state, logger: { warn: () => {} }, roots })
+    assert.equal(rec.reconciled, true)
+    assert.ok(rec.localKept.includes('plugins/web/package.json'), 'existing manifest reported as localKept: ' + JSON.stringify(rec.localKept))
+    assert.equal(fs.readFileSync(join(live, '.dsh', 'profiles', 'web', 'package.json'), 'utf8'), '{"bundles":["ours"]}', 'existing manifest NOT overwritten (boot safety)')
+    assert.equal(fs.readFileSync(join(live, '.dsh', 'profiles', 'their-extra', 'package.json'), 'utf8'), '{"bundles":["theirs-extra"]}', 'new profile manifests still arrive (union)')
+  } finally {
+    await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {})
+  }
+})

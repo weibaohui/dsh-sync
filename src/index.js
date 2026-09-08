@@ -514,6 +514,8 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
     if (!livePath) { skipped++; continue }
     let liveBuf = null
     try { liveBuf = await fsP.readFile(livePath) } catch {}
+    // 机器专属保护：本地已有的插件清单文件绝不被远端覆盖（同 reconcileRemote）
+    if ((p === 'plugins' || p.startsWith('plugins/')) && liveBuf !== null) { skipped++; continue }
     let lastSyncedBuf = null
     try { lastSyncedBuf = await gitShowBuf(binary, `${lastSynced}:${p}`, repoDir) } catch { lastSyncedBuf = Buffer.alloc(0) }
     const untouched = liveBuf === null ? (lastSyncedBuf.length === 0) : Buffer.compare(liveBuf, lastSyncedBuf) === 0
@@ -565,6 +567,7 @@ async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
   const applied = []        // safely written back to live
   const bothModified = []   // both sides changed → AI align / conflict PR
   const remoteDeleted = []  // gone on remote; live keeps its copy
+  const localKept = []      // machine-owned plugin manifests the remote may not touch
   for (const p of changed) {
     const livePath = resolveLivePath(spec, p)
     if (!livePath) continue
@@ -573,6 +576,10 @@ async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
     if (remoteBuf === null) { remoteDeleted.push(p); continue }
     let liveBuf = null
     try { liveBuf = await fsP.readFile(livePath) } catch {}
+    // 插件清单是机器专属启动配置：本地已有的文件绝不被远端覆盖（真机实证：对端
+    // package.json 覆盖本机 web profile 的 bundle 列表 → 宿主重启解析不到 bundle，
+    // launchd crash loop）。本地没有的清单文件照常回填，新机器的清单以并集到来。
+    if ((p === 'plugins' || p.startsWith('plugins/')) && liveBuf !== null) { localKept.push(p); continue }
     let lastSyncedBuf = null
     try { lastSyncedBuf = await gitShowBuf(binary, `${lastSynced}:${p}`, repoDir) } catch { lastSyncedBuf = Buffer.alloc(0) }
     const untouched = liveBuf === null ? (lastSyncedBuf.length === 0) : Buffer.compare(liveBuf, lastSyncedBuf) === 0
@@ -584,7 +591,7 @@ async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
   await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
   await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
   state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
-  return { reconciled: true, applied, bothModified, remoteDeleted, changed: changed.length }
+  return { reconciled: true, applied, bothModified, remoteDeleted, localKept, changed: changed.length }
 }
 
 // ── Conflict-resolution action button: in-process agent (same channel as
