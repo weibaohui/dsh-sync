@@ -913,8 +913,10 @@ module.exports = {
     // ── Sync run: lock → push → pull → save ──
     let syncRun = null
     // 自动对齐去重：同一批 bothModified 文件 30 分钟内只自动跑一次，防止 agent
-    // 解决失败时随 autoSync 无限重试
+    // 解决失败时随 autoSync 无限重试；规模闸门：清单太大（首收敛 churn、误删回滚）
+    // 不是人类尺度的"冲突"，AI 逐文件语义合并不现实，留给状态页展示/人工处理
     const ALIGN_COOLDOWN_MS = 30 * 60 * 1000
+    const AUTO_ALIGN_MAX_FILES = 50
     const alignState = { active: false, lastSig: '', lastAt: 0 }
     const runSync = async ({ autoAlign = true } = {}) => {
       if (syncRun !== null) return syncRun
@@ -938,11 +940,12 @@ module.exports = {
           result.push = await runPush(eff.gitBinary, eff, { ...ctx2, preserve: both.map(f => f.shadowPath) }).catch(e => { result.pushError = String(e && e.message); return null })
           result.pull = await runPull(eff.gitBinary, eff, ctx2).catch(e => { result.pullError = String(e && e.message); return null })
           state.lastSyncAt = new Date().toISOString()
-          state.lastResult = { ...result, at: state.lastSyncAt, durationMs: Date.now() - started }
-          await saveState()
           // conflictMode=ai：检测到双方改动 → 自动触发 AI 智能对齐（后台 job，
           // 会话内可追问；agent 合并完 live 文件后自己会 curl /dsh-sync/api/sync 推送）
-          if (autoAlign && eff.conflictMode === 'ai' && both.length > 0 && !alignState.active) {
+          result.alignSkipped = autoAlign && eff.conflictMode === 'ai' && both.length > AUTO_ALIGN_MAX_FILES
+            ? { reason: `bothModified ${both.length} 个，超过自动对齐规模上限 ${AUTO_ALIGN_MAX_FILES}（多为双机首次收敛 churn，非人工冲突）；保留双方版本，可到设置页手动处理` }
+            : undefined
+          if (autoAlign && eff.conflictMode === 'ai' && both.length > 0 && both.length <= AUTO_ALIGN_MAX_FILES && !alignState.active) {
             const sig = both.map(f => f.shadowPath).sort().join('|')
             if (sig !== alignState.lastSig || Date.now() - alignState.lastAt > ALIGN_COOLDOWN_MS) {
               alignState.lastSig = sig
@@ -951,6 +954,8 @@ module.exports = {
               if (startedJob) result.align = { jobId: startedJob.id, bothModified: both.map(f => f.shadowPath) }
             }
           }
+          state.lastResult = { ...result, at: state.lastSyncAt, durationMs: Date.now() - started }
+          await saveState()
         } finally { release() }
         return result
       })().finally(() => { syncRun = null })
