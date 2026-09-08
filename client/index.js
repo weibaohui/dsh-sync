@@ -100,6 +100,20 @@ const ZH = {
   strategyRemote: '覆盖 · 远端为准',
   strategyLocal: '覆盖 · 本地为准',
   strategyHint: '备份=云上各存各的（backup/实例ID/），本地永不被覆盖；并集=新增都收、双方改动交 AI；远端为准=本地只读镜像；本地为准=只推不拉',
+  snapshotTitle: '快照',
+  snapshotNow: '立即快照',
+  snapshotNamePlaceholder: '快照名（可选）',
+  snapshotCloud: '上传到云端 git',
+  snapshotAutoLabel: '每天自动快照',
+  snapshotSkillsLabel: '快照含技能',
+  snapshotKeepLabel: '本地保留份数',
+  snapshotHint: '快照优先存本地：滚动保留、超窗真删除真释放；勾了云端的才会写进 git 永久存档；恢复前会自动把当前状态再拍一份。',
+  snapshotEmpty: '还没有快照',
+  snapshotInCloud: '已上云',
+  snapshotLocalOnly: '仅本地',
+  snapshotRestore: '恢复',
+  snapshotBusy: '快照处理中…',
+  restoreDone: '已恢复（当前状态已先拍快照），同步已触发',
   conflictTitle: '解决同步冲突',
   conflictHint: '检测到未合并的同步 PR（两台机器改了同一文件）。点击下方按钮，AI 会读取本机令牌、分析两边改动、解决冲突并合并 PR。',
   conflictPending: '有未解决的冲突 PR',
@@ -157,6 +171,20 @@ const EN = {
   strategyRemote: 'Overwrite · remote wins',
   strategyLocal: 'Overwrite · local wins',
   strategyHint: 'Backup = each machine stores its own (backup/<id>/), local never overwritten; Union = collect all adds, both-side edits go to AI; remote wins = local read-only mirror; local wins = push-only',
+  snapshotTitle: 'Snapshots',
+  snapshotNow: 'Snapshot now',
+  snapshotNamePlaceholder: 'snapshot name (optional)',
+  snapshotCloud: 'Upload to cloud git',
+  snapshotAutoLabel: 'Daily auto snapshot',
+  snapshotSkillsLabel: 'Include skills',
+  snapshotKeepLabel: 'Local keep count',
+  snapshotHint: 'Snapshots are local-first: rolling window, over-window ones are truly deleted; only checked ones are written to git as permanent archive; the current state is snapshotted automatically before any restore.',
+  snapshotEmpty: 'No snapshots yet',
+  snapshotInCloud: 'in cloud',
+  snapshotLocalOnly: 'local',
+  snapshotRestore: 'Restore',
+  snapshotBusy: 'Working…',
+  restoreDone: 'Restored (current state snapshotted first); sync triggered',
   conflictTitle: 'Resolve sync conflict',
   conflictHint: 'An unmerged sync PR exists (two machines edited the same file). Click below: the AI reads the local token, analyzes both sides, resolves the conflict and merges the PR.',
   conflictPending: 'Unresolved conflict PR',
@@ -360,6 +388,11 @@ function SettingsSection({ t }) {
   const [conflictMode, setConflictMode] = useState('ai')
   const [g, setG] = useState({ skills: true, sessions: false, settings: true, plugins: true })
   const [gs, setGs] = useState({ skills: 'union', sessions: 'backup', settings: 'backup', plugins: 'backup' })
+  const [snapCfg, setSnapCfg] = useState({ auto: true, skills: false, localKeep: 30 })
+  const [snapList, setSnapList] = useState(null)
+  const [snapName, setSnapName] = useState('')
+  const [snapCloud, setSnapCloud] = useState(false)
+  const [snapBusy, setSnapBusy] = useState(false)
 
   const onToast = (text, ms = 3000) => { setToastText(text); setTimeout(() => setToastText(null), ms) }
   const refresh = () => getJson(API + '/status').then(d => {
@@ -372,6 +405,8 @@ function SettingsSection({ t }) {
     setConflictMode(d.conflictMode)
     setG({ skills: d.syncSkills, sessions: d.syncSessions, settings: d.syncSettings, plugins: d.syncPlugins })
     if (d.strategies) setGs(d.strategies)
+    if (d.snapshot) setSnapCfg(d.snapshot)
+    getJson(API + '/snapshot/list').then(l => setSnapList(l)).catch(() => {})
   }).catch(() => {})
   useEffect(() => {
     refresh()
@@ -412,13 +447,36 @@ function SettingsSection({ t }) {
   }
   const doSave = async () => {
     try {
-      const patch = { repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode, syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins, skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins }
+      const patch = { repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode, syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins, skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins, snapshotAuto: snapCfg.auto, snapshotSkills: snapCfg.skills, snapshotLocalKeep: snapCfg.localKeep }
       if (token !== '') patch.token = token
       await putSettings(patch)
       setToken('')
       onToast(t('saved'), 2200)
       refresh()
     } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
+  }
+  const doSnapshot = async () => {
+    setSnapBusy(true)
+    try {
+      const r = await fetch(API + '/snapshot/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: snapName || undefined, cloud: snapCloud }) })
+      const d = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
+      setSnapName('')
+      onToast(t('restoreDone') === '' ? '' : t('saved'), 2200)
+      refresh()
+    } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
+    finally { setSnapBusy(false) }
+  }
+  const doRestore = async (name) => {
+    setSnapBusy(true)
+    try {
+      const r = await fetch(API + '/snapshot/restore', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) })
+      const d = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
+      onToast(t('restoreDone'), 3000)
+      refresh()
+    } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
+    finally { setSnapBusy(false) }
   }
   const doClearToken = async () => {
     try { await putSettings({ token: null }); onToast(t('saved'), 2200); refresh() }
@@ -479,6 +537,34 @@ function SettingsSection({ t }) {
               h('input', { type: 'checkbox', checked: syncOnStartup, onChange: e => setSyncOnStartup(e.target.checked) }), t('syncOnStartupLabel')),
             h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
               t('intervalLabel'), h('input', { className: 'sk-input', type: 'number', min: 5, value: intervalMinutes, onChange: e => setIntervalMinutes(Math.max(1, Number(e.target.value) || 30)), style: { width: 80 } }))),
+          h('div', { className: 'sk-card' },
+            h('div', { className: 'sk-head' },
+              h('span', { className: 'sk-dir' }, t('snapshotTitle')),
+              h('span', { className: 'sk-spacer' }),
+              snapBusy && h(Tag, { tone: 'accent' }, t('snapshotBusy')),
+              h('input', { className: 'sk-input', value: snapName, onChange: e => setSnapName(e.target.value), placeholder: t('snapshotNamePlaceholder'), style: { width: 180 } }),
+              h('label', { style: { display: 'flex', alignItems: 'center', gap: 5, color: 'var(--dsw-alias-label-secondary)', fontSize: 12.5 } },
+                h('input', { type: 'checkbox', checked: snapCloud, onChange: e => setSnapCloud(e.target.checked) }), t('snapshotCloud')),
+              h(ButtonLite, { primary: true, small: true, disabled: snapBusy, onClick: doSnapshot }, t('snapshotNow'))),
+            h('div', { className: 'sk-hint' }, t('snapshotHint')),
+            h('div', { style: { display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'center', color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
+              h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+                h('input', { type: 'checkbox', checked: snapCfg.auto, onChange: e => setSnapCfg(p => ({ ...p, auto: e.target.checked })) }), t('snapshotAutoLabel')),
+              h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+                h('input', { type: 'checkbox', checked: snapCfg.skills, onChange: e => setSnapCfg(p => ({ ...p, skills: e.target.checked })) }), t('snapshotSkillsLabel')),
+              h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+                t('snapshotKeepLabel'),
+                h('input', { className: 'sk-input', type: 'number', min: 1, value: snapCfg.localKeep, onChange: e => setSnapCfg(p => ({ ...p, localKeep: Math.max(1, Number(e.target.value) || 30) })), style: { width: 64 } }))),
+            snapList === null
+              ? null
+              : (snapList.local.length === 0
+                ? h('div', { className: 'sk-hint' }, t('snapshotEmpty'))
+                : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
+                    snapList.local.map(s => h('div', { key: s.name, style: { display: 'flex', alignItems: 'center', gap: 10, padding: '4px 8px', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 8 } },
+                      h('span', { style: { fontSize: 12.5 } }, s.name),
+                      h(Tag, { tone: s.inCloud ? 'accent' : undefined }, s.inCloud ? t('snapshotInCloud') : t('snapshotLocalOnly')),
+                      h('span', { className: 'sk-spacer' }),
+                      h(ButtonLite, { small: true, disabled: snapBusy, onClick: () => doRestore(s.name) }, t('snapshotRestore'))))))),
           h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
             h('input', { className: 'sk-input', value: repoUrl, onChange: e => setRepoUrl(e.target.value), placeholder: t('repoUrlPlaceholder'), style: { width: '100%' } }),
             h('input', { className: 'sk-input', value: branch, onChange: e => setBranch(e.target.value), placeholder: t('branchLabel'), style: { width: '100%' } }),

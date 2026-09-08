@@ -677,3 +677,52 @@ test('strategy backup: push lands in backup/<instanceId>/, never overwrites shar
     await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {})
   }
 })
+
+// ── Snapshots: local-first, cloud on explicit opt-in ─────────────────────
+
+test('snapshotMirrorSpec + sanitizeSnapshotName', () => {
+  const roots = { dshSkills: '/dsh', agentsSkills: '/a', agentsLock: '/l', sessions: '/s', settingsFile: '/st', profiles: '/p' }
+  const spec = I.snapshotMirrorSpec({ syncSkills: true, syncSessions: true, syncSettings: true, syncPlugins: true, snapshotSkills: false }, roots, 'inst-1', 'auto-2026-09-09')
+  const names = spec.map(g => g.name).sort().join(',')
+  assert.equal(names, 'plugins,settings', 'sessions excluded, skills excluded by default')
+  const settingsSrc = spec.find(g => g.name === 'settings').sources[0]
+  assert.equal(settingsSrc.to, 'snapshots/auto-2026-09-09/settings/settings.yaml', 'snapshots/<name>/ prefix')
+  const withSkills = I.snapshotMirrorSpec({ syncSkills: true, syncSessions: true, syncSettings: true, syncPlugins: true, snapshotSkills: true }, roots, 'inst-1', 'x')
+  assert.ok(withSkills.some(g => g.name === 'skills'), 'skills included when opted in')
+  assert.ok(!withSkills.some(g => g.name === 'sessions'), 'sessions always excluded')
+  assert.equal(I.sanitizeSnapshotName('  发版前 <ok>:v1? '), '发版前-ok-v1')
+  assert.equal(I.sanitizeSnapshotName('///'), '')
+})
+
+test('pruneLocalSnapshots: rolling window, manual-unclouded exempt', async () => {
+  const tmp = await mkdtemp()
+  const dir = join(tmp, 'snapshots')
+  const mk = async (name) => { await fsp.mkdir(join(dir, name), { recursive: true }); await fsp.writeFile(join(dir, name, 'f.txt'), name) }
+  for (const n of ['auto-2026-01-0' + 1, 'auto-2026-01-02', 'manual-my-keep', 'manual-not-in-cloud', 'pre-restore-x']) await mk(n)
+  const removed = await I.pruneLocalSnapshots(dir, 3, ['manual-my-keep'])
+  // sorted desc: manual-not-in-cloud, pre-restore-x, manual-my-keep, auto-02, auto-01 → keep 3, prune 2 oldest
+  assert.deepEqual(removed.sort(), ['auto-2026-01-01', 'auto-2026-01-02'], 'oldest auto/prerestore pruned')
+  assert.ok(fs.existsSync(join(dir, 'manual-not-in-cloud')), 'manual unclouded never auto-pruned')
+  assert.deepEqual(await I.pruneLocalSnapshots(dir, 10, []), [], 'keep above count prunes nothing')
+})
+
+test('promoteSnapshotToCloud: bare remote gets snapshot tree on pushed branch', async () => {
+  const tmp = await mkdtemp()
+  const bareRepo = await mkRepo(tmp)
+  const repoDir = join(tmp, 'repo')
+  const srcDir = join(tmp, 'snap', 'manual-v1')
+  await fsp.mkdir(join(srcDir, 'settings'), { recursive: true })
+  await fsp.writeFile(join(srcDir, 'settings', 'settings.yaml'), 'provider: snap\n')
+  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', token: '' }
+  const state = { instanceId: 'testhost-snap' }
+  try {
+    await I.ensureShadowRepo('git', { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', token: '' }, repoDir)
+    const r = await I.promoteSnapshotToCloud('git', eff, { repoDir, instanceId: state.instanceId, state, logger: { warn: () => {} } }, 'manual-v1', srcDir)
+    assert.equal(r.promoted, true)
+    assert.equal(r.prSkipped, true, 'non-GitCode remote pushes branch directly')
+    const blob = await new Promise((res, rej) => execFile('git', ['show', `${r.branch}:backup/testhost-snap/snapshots/manual-v1/settings/settings.yaml`], { cwd: repoDir }, (e, o) => e ? rej(e) : res(String(o))))
+    assert.equal(blob, 'provider: snap\n', 'snapshot content landed under backup/<id>/snapshots/<name>/')
+  } finally {
+    await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {})
+  }
+})
