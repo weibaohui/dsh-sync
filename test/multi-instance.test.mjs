@@ -208,3 +208,56 @@ test('第四机首接：并集加入，不删其他副本的内容，自己内�
     assert.ok(fs.existsSync(join(r4.live, '.dsh', 'skills', 'only-r1', 'SKILL.md')), 'r4 拉回 r1 内容')
   } finally { await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {}) }
 })
+
+// ── 远端技能库：索引各主机备份 + 选择性安装 ──────────────────────────────
+
+test('remoteSkillsIndex/install: 从其他主机的备份命名空间挑选技能装到本机', async () => {
+  const tmp = await mkdtemp()
+  const hub = await mkHub(tmp)
+  const baseEff = { repoUrl: hub, branch: 'main', gitBinary: 'git', syncSkills: true, syncSessions: false, syncSettings: false, syncPlugins: false, token: '' }
+  const r1 = await mkReplica(tmp, 'r1', baseEff)
+  const r2 = await mkReplica(tmp, 'r2', { ...baseEff, skillsStrategy: 'backup' })
+  try {
+    // r1（union 策略）推共享技能；r2（backup 策略）技能进自己的备份命名空间
+    await write(join(r1.live, '.dsh', 'skills', 'shared-one', 'SKILL.md'), '# shared one\n')
+    await write(join(r1.live, '.dsh', 'skills', 'shared-two', 'SKILL.md'), '# shared two\n')
+    await write(join(r2.live, '.dsh', 'skills', 'private-r2', 'SKILL.md'), '# r2 private\n')
+    await write(join(r2.live, '.dsh', 'skills', 'private-r2', 'references', 'a.md'), 'ref\n')
+    await driveSync(r1)
+    await driveSync(r2)
+    // r1 视角的云端索引：union（2 个技能）+ r2 的备份（1 个技能），不含 r1 自己
+    const index = await I.remoteSkillsIndex('git', r1.eff, { repoDir: r1.repoDir, instanceId: 'r1' })
+    const ids = index.sources.map(s => s.id).sort().join(',')
+    assert.equal(ids, 'r2,union', 'sources = union + 其他主机备份: ' + ids)
+    const union = index.sources.find(s => s.id === 'union')
+    assert.equal(union.trees[0].tree, 'dsh')
+    assert.equal(union.trees[0].skills.length, 3, 'union 有三个技能（含种子 base）')
+    const r2src = index.sources.find(s => s.id === 'r2')
+    assert.equal(r2src.trees[0].skills[0].name, 'private-r2')
+    assert.equal(r2src.trees[0].skills[0].files, 2, '文件数统计正确')
+    // 安装 r2 的私有技能到 r1（overwrite=false）
+    const res = await I.installRemoteSkills('git', r1.eff, { repoDir: r1.repoDir, roots: r1.roots }, {
+      source: 'r2', skills: [{ tree: 'dsh', name: 'private-r2' }], overwrite: false,
+    })
+    assert.deepEqual(res.installed, ['dsh/private-r2'])
+    assert.equal(read(join(r1.live, '.dsh', 'skills', 'private-r2', 'SKILL.md')), '# r2 private\n', '技能内容落盘')
+    assert.equal(read(join(r1.live, '.dsh', 'skills', 'private-r2', 'references', 'a.md')), 'ref\n', '子目录文件一并安装')
+    // 再装一次（同名）：默认跳过；overwrite=true 替换
+    const res2 = await I.installRemoteSkills('git', r1.eff, { repoDir: r1.repoDir, roots: r1.roots }, {
+      source: 'r2', skills: [{ tree: 'dsh', name: 'private-r2' }], overwrite: false,
+    })
+    assert.deepEqual(res2.skipped, ['dsh/private-r2'], '同名默认跳过')
+    await write(join(r2.live, '.dsh', 'skills', 'private-r2', 'SKILL.md'), '# r2 v2\n')
+    await driveSync(r2)
+    const res3 = await I.installRemoteSkills('git', r1.eff, { repoDir: r1.repoDir, roots: r1.roots }, {
+      source: 'r2', skills: [{ tree: 'dsh', name: 'private-r2' }], overwrite: true,
+    })
+    assert.deepEqual(res3.installed, ['dsh/private-r2'], 'overwrite=true 替换')
+    assert.equal(read(join(r1.live, '.dsh', 'skills', 'private-r2', 'SKILL.md')), '# r2 v2\n')
+    // 安装不存在的技能 → failed
+    const res4 = await I.installRemoteSkills('git', r1.eff, { repoDir: r1.repoDir, roots: r1.roots }, {
+      source: 'r2', skills: [{ tree: 'dsh', name: 'no-such' }], overwrite: true,
+    })
+    assert.equal(res4.failed.length, 1)
+  } finally { await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {}) }
+})
