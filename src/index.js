@@ -177,6 +177,10 @@ async function acquireLock(lockFile) {
     fs.closeSync(handle)
     return () => { try { fs.unlinkSync(lockFile) } catch {} }
   } catch (e) {
+    if (e.code === 'ENOENT') {
+      // 首装竞态：syncDir 还没建（state 铸造的 mkdir 未跑完）——补建后重试一次
+      try { fs.mkdirSync(join(lockFile, '..'), { recursive: true }); const handle = fs.openSync(lockFile, 'wx'); fs.writeSync(handle, String(process.pid)); fs.closeSync(handle); return () => { try { fs.unlinkSync(lockFile) } catch {} } } catch {}
+    }
     if (e.code === 'EEXIST') {
       // stale-lock recovery: a crashed process leaves a lock; if its pid is
       // gone, steal it. Otherwise someone else is syncing.
@@ -413,7 +417,7 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
   // 1. fetch origin/main → FETCH_HEAD (canonical baseline)
   try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
     // first-ever push to an empty remote: no main yet, skip fetch
-    if (!/Could not find|doesn't exist|no such|empty/i.test(String(e && e.message))) throw e
+    if (!/could ?n[o']?t find|doesn't exist|no such|unborn|empty/i.test(String(e && e.message))) throw e
   }
 
   // 2. branch off FETCH_HEAD (or HEAD if remote was empty), reset shadow to it
@@ -570,11 +574,54 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
       applied++
     } catch { skipped++ }
   }
+  // 覆盖·远端为准的组：整组强制镜像（本地只读）——不在本轮变更集里的文件也要
+  // 回归远端版本（本地乱改被冲掉、本地多出来的文件按远端为准删除）
+  for (const group of spec.filter(g => g.strategy === 'remote')) {
+    for (const src of group.sources) {
+      const shadowDir = join(repoDir, src.to)
+      const haveShadow = await fsP.access(shadowDir).then(() => true).catch(() => false)
+      if (!haveShadow) continue
+      if (src.file) {
+        try { await fsP.mkdir(join(src.from, '..'), { recursive: true }); await fsP.copyFile(shadowDir, src.from); applied++ } catch {}
+        continue
+      }
+      // --name-status 输出的是第一参数（旧侧）路径：live 在前，行内路径即 live 文件
+      const diffOut = await gitDiffNameStatus(src.from, shadowDir, repoDir, binary)
+      for (const line of diffOut.split(/\r?\n/)) {
+        const m = line.match(/^([AMD])\t(.*)$/)
+        if (!m) continue
+        const livePath = m[2]
+        if (!livePath.startsWith(src.from)) continue
+        const remoteFile = join(shadowDir, relFrom(livePath, src.from))
+        const remoteHave = await fsP.access(remoteFile).then(() => true).catch(() => false)
+        try {
+          if (m[1] === 'A') await fsP.rm(livePath, { recursive: true, force: true })   // 仅本地有 → 按远端为准删除
+          else { await fsP.mkdir(join(livePath, '..'), { recursive: true }); await fsP.copyFile(remoteFile, livePath) }
+          applied++
+        } catch {}
+      }
+    }
+  }
   // advance shadow baseline to the freshly-pulled main
   await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
   await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
   state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
   return { pulled: true, applied, skipped, changed: changed.length }
+}
+
+/** git diff --no-index --name-status：差异时退出码非 0 但 stdout 仍列出差异
+ *  （M/D=旧侧有新侧变、A=仅新侧有），需专用 helper 接住非零退出。 */
+function gitDiffNameStatus(a, b, cwd, binary) {
+  return new Promise((resolve) => {
+    execFile(binary, ['diff', '--no-index', '--name-status', '--no-renames', a, b], { cwd, maxBuffer: 16 * 1024 * 1024 }, (error, stdout) => resolve(String(stdout || '')))
+  })
+}
+
+/** 求路径相对基准目录的相对部分（路径分隔符归一为 /）。 */
+function relFrom(p, base) {
+  const pn = p.split(sep).join('/').replace(/\/$/, '')
+  const bn = base.split(sep).join('/').replace(/\/$/, '') + '/'
+  return pn.startsWith(bn) ? pn.slice(bn.length) : pn
 }
 
 // ── Pre-push reconcile: pull remote changes back into live BEFORE the
@@ -592,19 +639,14 @@ async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
   const remote = authedUrl(eff.repoUrl, eff.token)
   const spec = syncSpec(eff, roots, state.instanceId)
   try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
-    if (!/Could not find|doesn't exist|no such|empty/i.test(String(e && e.message))) throw e
+    if (!/could ?n[o']?t find|doesn't exist|no such|unborn|empty/i.test(String(e && e.message))) throw e
     return { reconciled: false, empty: true }
   }
   const hasFetch = await gitExec(binary, ['rev-parse', '--verify', 'FETCH_HEAD'], repoDir).then(() => true).catch(() => false)
   if (!hasFetch) return { reconciled: false, empty: true }
-  const lastSynced = state.lastSyncedCommit
-  if (!lastSynced) {
-    // never synced: nothing to diff against; just record the baseline
-    await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
-    await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
-    state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
-    return { reconciled: false, firstBaseline: true }
-  }
+  // 首次同步基线 = 空树：云端全部内容按「远端新增、本机未动」回填 live（并集下载），
+  // 否则新机器只在远端文件发生后续变更时才拿得到它们（真机联调发现的缺口）
+  const lastSynced = state.lastSyncedCommit || '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
   let changedRaw = ''
   try { changedRaw = await gitExec(binary, ['diff', '--name-only', lastSynced, 'FETCH_HEAD'], repoDir) } catch {}
   const changed = changedRaw.split(/\r?\n/).map(s => s.trim()).filter(Boolean)
@@ -729,7 +771,7 @@ async function pruneLocalSnapshots(snapshotsDir, keep, cloudNames) {
 async function promoteSnapshotToCloud(binary, eff, { repoDir, instanceId, state, logger }, snapName, srcDir) {
   const remote = authedUrl(eff.repoUrl, eff.token)
   try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
-    if (!/Could not find|doesn't exist|no such|empty/i.test(String(e && e.message))) throw e
+    if (!/could ?n[o']?t find|doesn't exist|no such|unborn|empty/i.test(String(e && e.message))) throw e
   }
   const hasRemote = await gitExec(binary, ['rev-parse', '--verify', 'FETCH_HEAD'], repoDir).then(() => true).catch(() => false)
   if (hasRemote) await gitExec(binary, ['checkout', '--detach', 'FETCH_HEAD'], repoDir).catch(() => {})
@@ -1123,6 +1165,8 @@ module.exports = {
         const started = Date.now()
         let result = { pushed: false, pulled: false }
         try {
+          // 影子仓库先行（首次运行在这里 clone）：reconcile 需要它来 fetch/回填
+          await ensureShadowRepo(eff.gitBinary, eff, repoDir).catch(e => ctx.logger.warn(`dsh-sync: shadow init: ${e && e.message}`))
           const ctx2 = { repoDir, instanceId: state.instanceId, state, logger: ctx.logger }
           // reconcile first: pull remote-only/untouched changes into live so
           // the full-snapshot push below never deletes another replica's adds
