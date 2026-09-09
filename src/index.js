@@ -33,7 +33,7 @@ const { execFile } = require('node:child_process')
 const { randomUUID } = require('node:crypto')
 const fsP = require('node:fs/promises')
 const { join, relative, resolve, sep } = require('node:path')
-const { homedir, hostname } = require('node:os')
+const { homedir, hostname, tmpdir } = require('node:os')
 // settings 服务要求 schemastery schema（可调用 + toJSON；zod 不兼容，register 会抛错被吞）。
 // 宿主沙箱内解析打包依赖可能抛 ERR_INTERNAL_ASSERTION（.pnpm 软链），因此优先沿
 // dsh 全局安装取 settings 服务自用的那份副本，本地开发/测试再退回标准 require。
@@ -815,6 +815,106 @@ async function promoteSnapshotToCloud(binary, eff, { repoDir, instanceId, state,
   return { promoted: true, merged, prNumber, branch }
 }
 
+// ── Remote skills: browse cloud skill sources, selectively install ──────
+//    来源 = 共享并集树（skills/）+ 各主机备份命名空间（backup/<实例ID>/skills/，
+//    不含本机）。列出 每来源每树的技能（文件数/字节），安装 = git archive 取出
+//    技能目录写入本机对应技能根（同名默认跳过，可选覆盖），完成后触发一次同步。
+
+/** 从 ls-tree -r -l 输出归并出「技能 → {files, bytes}」清单。 */
+function skillsFromLsTree(out, prefix) {
+  const skills = new Map()
+  for (const line of out.split(/\r?\n/)) {
+    if (!line.trim()) continue
+    const tab = line.indexOf('\t')
+    if (tab < 0) continue
+    const path = line.slice(tab + 1)
+    const meta = line.slice(0, tab).trim().split(/\s+/)
+    const bytes = Number(meta[meta.length - 2]) || 0
+    const rel = path.slice(prefix.length + 1)
+    const slash = rel.indexOf('/')
+    if (slash <= 0) continue
+    const name = rel.slice(0, slash)
+    const cur = skills.get(name) || { name, files: 0, bytes: 0 }
+    cur.files += 1
+    cur.bytes += bytes
+    skills.set(name, cur)
+  }
+  return [...skills.values()].sort((a, b) => a.name.localeCompare(b.name))
+}
+
+/** 云端技能来源索引：union 共享树 + 其他主机的 backup 命名空间（不含本机）。 */
+async function remoteSkillsIndex(binary, eff, { repoDir, instanceId }) {
+  const remote = authedUrl(eff.repoUrl, eff.token)
+  try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
+    if (!/could ?n[o']?t find|doesn't exist|no such|unborn|empty/i.test(String(e && e.message))) throw e
+    return { sources: [] }
+  }
+  const hasFetch = await gitExec(binary, ['rev-parse', '--verify', 'FETCH_HEAD'], repoDir).then(() => true).catch(() => false)
+  if (!hasFetch) return { sources: [] }
+  const defs = [{ id: 'union', prefix: 'skills' }]
+  const tops = await gitExec(binary, ['ls-tree', '--name-only', 'FETCH_HEAD', 'backup/'], repoDir).catch(() => '')
+  for (const line of tops.split(/\r?\n/)) {
+    const id = line.trim().replace(/^backup\//, '').replace(/\/$/, '')
+    if (id && id !== instanceId) defs.push({ id, prefix: `backup/${id}/skills` })
+  }
+  const sources = []
+  for (const def of defs) {
+    const trees = []
+    let lastCommit = undefined
+    try { lastCommit = (await gitExec(binary, ['log', '-1', '--format=%cs', 'FETCH_HEAD', '--', `${def.prefix}/`], repoDir)).trim() || undefined } catch {}
+    for (const tree of ['dsh', 'agents']) {
+      const out = await gitExec(binary, ['ls-tree', '-r', '-l', 'FETCH_HEAD', '--', `${def.prefix}/${tree}`], repoDir).catch(() => '')
+      const skills = skillsFromLsTree(out, `${def.prefix}/${tree}`)
+      if (skills.length) trees.push({ tree, skills })
+    }
+    if (trees.length) sources.push({ id: def.id, lastCommit, trees })
+  }
+  return { sources }
+}
+
+/** 安装远端技能到本机对应技能根。skills: [{tree:'dsh'|'agents', name}]；
+ *  overwrite=false 时同名跳过。完成后由调用方触发同步。 */
+async function installRemoteSkills(binary, eff, { repoDir, roots }, { source, skills, overwrite }) {
+  // 先取最新远端，避免 archive 读到过期的 FETCH_HEAD
+  const remote0 = authedUrl(eff.repoUrl, eff.token)
+  try { await gitExec(binary, ['fetch', remote0, eff.branch], repoDir) } catch {}
+  const prefix = source === 'union' ? 'skills' : `backup/${source}/skills`
+  const installed = [], skipped = [], failed = []
+  for (const item of skills || []) {
+    const tree = item.tree === 'agents' ? 'agents' : 'dsh'
+    const name = sanitizeSnapshotName(item.name)
+    if (!name) { failed.push(`${tree}/${item.name}: 名字非法`); continue }
+    const targetDir = tree === 'agents' ? roots.agentsSkills : roots.dshSkills
+    const dest = join(targetDir, name)
+    const exists = await fsP.access(dest).then(() => true).catch(() => false)
+    if (exists && overwrite !== true) { skipped.push(`${tree}/${name}`); continue }
+    const tmp = await fsP.mkdtemp(join(tmpdir(), 'dshsync-rs-'))
+    try {
+      const archive = join(tmp, 'a.tar')
+      await new Promise((resolve, reject) => {
+        execFile(binary, ['archive', 'FETCH_HEAD', '--', `${prefix}/${tree}/${name}`], { cwd: repoDir, maxBuffer: 64 * 1024 * 1024, encoding: 'buffer' }, (error, stdout) => {
+          if (error && !(stdout && stdout.length)) { reject(new Error(`git archive ${prefix}/${tree}/${name}: ${String(error.message || '')}`)); return }
+          fsP.writeFile(archive, stdout).then(resolve, reject)
+        })
+      })
+      const outDir = join(tmp, 'x')
+      await fsP.mkdir(outDir, { recursive: true })
+      await new Promise((resolve, reject) => execFile('tar', ['-xf', archive, '-C', outDir], (e, o, er) => e ? reject(new Error(String(er || e.message).slice(-160))) : resolve()))
+      const extracted = join(outDir, prefix, tree, name)
+      const have = await fsP.access(extracted).then(() => true).catch(() => false)
+      if (!have) { failed.push(`${tree}/${name}: 云端不存在`); continue }
+      if (exists) await fsP.rm(dest, { recursive: true, force: true })
+      await copyTree(extracted, dest, {})
+      installed.push(`${tree}/${name}`)
+    } catch (e) {
+      failed.push(`${tree}/${name}: ${String(e && e.message || e).slice(0, 120)}`)
+    } finally {
+      await fsP.rm(tmp, { recursive: true, force: true }).catch(() => {})
+    }
+  }
+  return { installed, skipped, failed }
+}
+
 // ── Conflict-resolution action button: in-process agent (same channel as
 //    skills-management share-run). The agent operates the shadow repo's git
 //    directly + merges the PR via REST. Only this step needs semantic
@@ -1064,7 +1164,7 @@ function createAgentRunJob({ prompt, dir, jobs, logger, sessions, token, onFinis
 module.exports = {
   name: 'dsh-sync',
   inject: ['webServer', 'settings'],
-  __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, substituteParams, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud,
+  __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, substituteParams, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud, remoteSkillsIndex, installRemoteSkills, skillsFromLsTree,
     // apiproxy（导出供测试：mock fetch 驱动 wire 形态回归）
     apiproxy, apiproxyCall, apiproxyLegacy, mintCookie,
     __setConnection(svc) { connectionSvcRef = svc }, __resetApiproxyCache() { authedUrlCache = null; cookieCache = null } },
@@ -1585,6 +1685,33 @@ module.exports = {
             await pruneLocalSnapshots(join(syncDir, 'snapshots'), eff.snapshotLocalKeep || 30, state.cloudSnapshots).catch(() => [])
             runSync({ autoAlign: false }).catch(() => {})
             sendJson(res, 200, { restored: restored, safetySnapshot: safetyName })
+            return
+          }
+
+          // GET /dsh-sync/api/remote/skills → 云端技能来源索引（union + 各主机备份）
+          if (req.method === 'GET' && apiPath.endsWith('/dsh-sync/api/remote/skills')) {
+            await stateLoaded
+            const eff = syncSettings()
+            if (!eff.repoUrl || !eff.token) { sendJson(res, 400, { error: '未配置仓库或令牌' }); return }
+            try {
+              const index = await remoteSkillsIndex(eff.gitBinary, eff, { repoDir, instanceId: state.instanceId })
+              sendJson(res, 200, index)
+            } catch (e) { sendJson(res, 400, { error: String(e && e.message || e) }) }
+            return
+          }
+
+          // POST /dsh-sync/api/remote/skills/install {source, skills:[{tree,name}], overwrite?}
+          if (req.method === 'POST' && apiPath.endsWith('/dsh-sync/api/remote/skills/install')) {
+            const body = await readJsonBody(req)
+            await stateLoaded
+            const eff = syncSettings()
+            if (!eff.repoUrl || !eff.token) { sendJson(res, 400, { error: '未配置仓库或令牌' }); return }
+            if (!body.source || !Array.isArray(body.skills) || body.skills.length === 0) { sendJson(res, 400, { error: '缺少 source 或 skills' }); return }
+            try {
+              const result = await installRemoteSkills(eff.gitBinary, eff, { repoDir, roots: defaultRoots() }, body)
+              runSync({ autoAlign: false }).catch(() => {})
+              sendJson(res, 200, result)
+            } catch (e) { sendJson(res, 400, { error: String(e && e.message || e) }) }
             return
           }
 

@@ -124,6 +124,17 @@ window.__ModuleLoader__.load({
       snapshotRestore: '恢复',
       snapshotBusy: '快照处理中…',
       restoreDone: '已恢复（当前状态已先拍快照），同步已触发',
+      remoteTitle: '远端技能库',
+      remoteHint: '扫描云端各主机的技能备份与共享树，勾选一个或多个同步到本机；默认同名跳过。',
+      remoteUnion: '共享并集树',
+      remoteRefresh: '刷新',
+      remoteNone: '云端暂无其他主机的技能',
+      remoteInstall: '同步所选到本地',
+      remoteOverwrite: '覆盖同名',
+      remoteBusy: '安装中…',
+      remoteInstalled: '已安装 {n} 个，跳过 {s} 个',
+      remoteLastUpdate: '更新于',
+      remoteOwn: '（本机）',
       conflictTitle: '解决同步冲突',
       conflictHint: '检测到未合并的同步 PR（两台机器改了同一文件）。点击下方按钮，AI 会读取本机令牌、分析两边改动、解决冲突并合并 PR。',
       conflictPending: '有未解决的冲突 PR',
@@ -195,6 +206,17 @@ window.__ModuleLoader__.load({
       snapshotRestore: 'Restore',
       snapshotBusy: 'Working…',
       restoreDone: 'Restored (current state snapshotted first); sync triggered',
+      remoteTitle: 'Remote skills',
+      remoteHint: 'Scan cloud skill backups per host and the shared tree; check one or more to install locally; same-name skipped by default.',
+      remoteUnion: 'Shared union tree',
+      remoteRefresh: 'Refresh',
+      remoteNone: 'No skills from other hosts in the cloud yet',
+      remoteInstall: 'Install selected',
+      remoteOverwrite: 'Overwrite same-name',
+      remoteBusy: 'Installing…',
+      remoteInstalled: 'Installed {n}, skipped {s}',
+      remoteLastUpdate: 'updated',
+      remoteOwn: '(this machine)',
       conflictTitle: 'Resolve sync conflict',
       conflictHint: 'An unmerged sync PR exists (two machines edited the same file). Click below: the AI reads the local token, analyzes both sides, resolves the conflict and merges the PR.',
       conflictPending: 'Unresolved conflict PR',
@@ -403,6 +425,10 @@ window.__ModuleLoader__.load({
       const [snapName, setSnapName] = useState('')
       const [snapCloud, setSnapCloud] = useState(false)
       const [snapBusy, setSnapBusy] = useState(false)
+      const [remoteIndex, setRemoteIndex] = useState(null)
+      const [remoteSel, setRemoteSel] = useState({})
+      const [remoteOverwrite, setRemoteOverwrite] = useState(false)
+      const [remoteBusy, setRemoteBusy] = useState(false)
 
       const onToast = (text, ms = 3000) => { setToastText(text); setTimeout(() => setToastText(null), ms) }
       const refresh = () => getJson(API + '/status').then(d => {
@@ -417,6 +443,7 @@ window.__ModuleLoader__.load({
         if (d.strategies) setGs(d.strategies)
         if (d.snapshot) setSnapCfg(d.snapshot)
         getJson(API + '/snapshot/list').then(l => setSnapList(l)).catch(() => {})
+        getJson(API + '/remote/skills').then(r => setRemoteIndex(r)).catch(() => {})
       }).catch(() => {})
       useEffect(() => {
         refresh()
@@ -487,6 +514,36 @@ window.__ModuleLoader__.load({
           refresh()
         } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
         finally { setSnapBusy(false) }
+      }
+      const remoteToggle = (sid, tree, name) => {
+        const k = `${sid}::${tree}::${name}`
+        setRemoteSel(prev => { const next = { ...prev, [k]: !prev[k] }; return next })
+      }
+      const doRemoteInstall = async () => {
+        const bySource = {}
+        for (const [k, on] of Object.entries(remoteSel)) {
+          if (!on) continue
+          const [sid, tree, ...rest] = k.split('::')
+          const name = rest.join('::')
+          ;(bySource[sid] = bySource[sid] || []).push({ tree, name })
+        }
+        const entries = Object.entries(bySource)
+        if (entries.length === 0) { onToast(t('remoteNone'), 2500); return }
+        setRemoteBusy(true)
+        let n = 0, s = 0, err = null
+        try {
+          for (const [sid, skills] of entries) {
+            const r = await fetch(API + '/remote/skills/install', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source: sid, skills, overwrite: remoteOverwrite }) })
+            const d = await r.json().catch(() => ({}))
+            if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
+            n += (d.installed || []).length
+            s += (d.skipped || []).length + (d.failed || []).length
+          }
+          setRemoteSel({})
+          onToast(t('remoteInstalled', { n, s }), 3200)
+          refresh()
+        } catch (e) { err = e } finally { setRemoteBusy(false) }
+        if (err) onToast(err.message || t('operationFailed'), 4000)
       }
       const doClearToken = async () => {
         try { await putSettings({ token: null }); onToast(t('saved'), 2200); refresh() }
@@ -575,6 +632,37 @@ window.__ModuleLoader__.load({
                           h(Tag, { tone: s.inCloud ? 'accent' : undefined }, s.inCloud ? t('snapshotInCloud') : t('snapshotLocalOnly')),
                           h('span', { className: 'sk-spacer' }),
                           h(ButtonLite, { small: true, disabled: snapBusy, onClick: () => doRestore(s.name) }, t('snapshotRestore'))))))),
+              h('div', { className: 'sk-card' },
+                h('div', { className: 'sk-head' },
+                  h('span', { className: 'sk-dir' }, t('remoteTitle')),
+                  h('span', { className: 'sk-spacer' }),
+                  remoteBusy && h(Tag, { tone: 'accent' }, t('remoteBusy')),
+                  h(ButtonLite, { small: true, onClick: refresh }, t('remoteRefresh'))),
+                h('div', { className: 'sk-hint' }, t('remoteHint')),
+                remoteIndex === null
+                  ? null
+                  : (remoteIndex.sources.length === 0
+                    ? h('div', { className: 'sk-hint' }, t('remoteNone'))
+                    : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+                        remoteIndex.sources.map(src => h('div', { key: src.id, style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+                          h('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
+                            h('span', { style: { fontWeight: 600, fontSize: 13, color: 'var(--dsw-alias-label-primary)' } },
+                              src.id === 'union' ? t('remoteUnion') : src.id),
+                            src.id !== 'union' && src.id === status.instanceId && h('span', { className: 'sk-tag' }, t('remoteOwn')),
+                            src.lastCommit && h('span', { className: 'sk-dir' }, `${t('remoteLastUpdate')} ${src.lastCommit}`)),
+                          ...src.trees.map(tr => h('div', { key: tr.tree, style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(170px,1fr))', gap: 5 } },
+                            tr.skills.map(sk => {
+                              const k = `${src.id}::${tr.tree}::${sk.name}`
+                              return h('label', { key: k, className: 'sk-toggle' + (remoteSel[k] ? ' on' : ''), style: { padding: '5px 9px', fontSize: 12 } },
+                                h('input', { type: 'checkbox', checked: !!remoteSel[k], onChange: () => remoteToggle(src.id, tr.tree, sk.name) }),
+                                h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, sk.name),
+                                h('span', { className: 'sk-dir' }, `${sk.files}文件 ${(sk.bytes / 1024).toFixed(0)}K`))
+                            })))))),
+                remoteIndex && remoteIndex.sources.length > 0 && h('div', { style: { display: 'flex', gap: 10, alignItems: 'center' } },
+                  h('label', { style: { display: 'flex', alignItems: 'center', gap: 5, color: 'var(--dsw-alias-label-secondary)', fontSize: 12.5 } },
+                    h('input', { type: 'checkbox', checked: remoteOverwrite, onChange: e => setRemoteOverwrite(e.target.checked) }), t('remoteOverwrite')),
+                  h('span', { className: 'sk-spacer' }),
+                  h(ButtonLite, { primary: true, small: true, disabled: remoteBusy, onClick: doRemoteInstall }, t('remoteInstall'))))),
               h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
                 h('input', { className: 'sk-input', value: repoUrl, onChange: e => setRepoUrl(e.target.value), placeholder: t('repoUrlPlaceholder'), style: { width: '100%' } }),
                 h('input', { className: 'sk-input', value: branch, onChange: e => setBranch(e.target.value), placeholder: t('branchLabel'), style: { width: '100%' } }),
