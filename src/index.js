@@ -1063,7 +1063,7 @@ function createAgentRunJob({ prompt, dir, jobs, logger, sessions, token, onFinis
 
 module.exports = {
   name: 'dsh-sync',
-  inject: ['webServer', 'settings'],
+  inject: ['webServer', 'settings', 'connection'],
   __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, substituteParams, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud,
     // apiproxy（导出供测试：mock fetch 驱动 wire 形态回归）
     apiproxy, apiproxyCall, apiproxyLegacy, mintCookie,
@@ -1305,6 +1305,14 @@ module.exports = {
       kind: 'prefix',
       path: '/dsh-sync/api',
       handler: async (req, res) => {
+        // 与其它 host 路由一致的信任栅栏：connection 服务的 Host/Origin 检查
+        // 加浏览器认证，防止本机任意网页跨站调用。
+        const rejection = ctx.connection.requestRejection(req)
+        if (rejection !== undefined) {
+          res.writeHead(rejection)
+          res.end()
+          return
+        }
         try {
           const url = new URL(req.url || '/', 'http://dsh.local')
           const apiPath = url.pathname.replace(/\/+$/, '')
