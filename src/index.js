@@ -83,6 +83,80 @@ const DEFAULT_SYNC_SETTINGS = {
 
 const STRATEGY_VALUES = ['backup', 'union', 'remote', 'local']
 
+// ── 0.1.7 settings 接线 ──────────────────────────────────────────────────
+// settings 服务不再支持 ctx.settings.register：改为模块顶层导出 volatile
+// Config（宿主自动发现 + 自动生成设置页），读走 describe() 投影，写走
+// ctx.settings.update()（持久化进 profile patch，重启不丢）。
+// dsh-sync 的设置挂在插件 config 的 sync: 子对象下（与 cordis.patch.yml
+// config.sync.token 传入形态一致），整个子对象标 volatile。
+
+// 设置文档里的平铺字段（与旧版 settings.yaml 的 dsh-sync: 节同形）
+function syncSettingsSchema(S) {
+  return S.object({
+    repoUrl: S.string(),
+    branch: S.string(),
+    gitBinary: S.string(),
+    autoSync: S.boolean(),
+    syncOnStartup: S.boolean(),
+    intervalMinutes: S.number(),
+    conflictMode: S.string(),
+    syncSkills: S.boolean(),
+    syncSessions: S.boolean(),
+    syncSettings: S.boolean(),
+    syncPlugins: S.boolean(),
+    skillsStrategy: S.string(),
+    sessionsStrategy: S.string(),
+    settingsStrategy: S.string(),
+    pluginsStrategy: S.string(),
+    snapshotSkills: S.boolean(),
+    snapshotAuto: S.boolean(),
+    snapshotLocalKeep: S.number(),
+    token: S.string(),
+  })
+}
+let Config = null
+try {
+  Config = Schema
+    ? Schema.object({
+      sync: syncSettingsSchema(Schema).volatile(),
+      repoUrl: Schema.string().volatile(), // 旧版平铺形态兼容位
+    })
+    : null
+} catch { /* schemastery <3.18.4 无 .volatile()：降级为无 Config（设置写回不可用），插件运行不受影响 */ }
+
+// legacy settings.yaml.imported 读取（dsh 0.1.7 迁移残留；只支持平铺 key: value）
+function legacySettingsPath() {
+  return process.env.DSH_HOME ? join(resolve(process.env.DSH_HOME), 'settings.yaml.imported') : join(homedir(), '.dsh', 'settings.yaml.imported')
+}
+let __legacyYamlOverride
+function __seedLegacyYaml(text) { __legacyYamlOverride = text === undefined ? undefined : text === null ? null : String(text) }
+function readLegacyYaml() {
+  if (__legacyYamlOverride !== undefined) return __legacyYamlOverride
+  try { return require('node:fs').readFileSync(legacySettingsPath(), 'utf8') } catch { return null }
+}
+function parseLegacySettingsYaml(text) {
+  try {
+    const lines = String(text || '').split(/\r?\n/)
+    const start = lines.findIndex((line) => /^dsh-sync:/.test(line))
+    if (start === -1) return null
+    const out = {}
+    for (let i = start + 1; i < lines.length; i++) {
+      const line = lines[i]
+      if (!line.trim()) continue
+      if (!/^\s/.test(line)) break // 下一节开始
+      const m = line.match(/^\s+([A-Za-z0-9_]+):\s*(.*)$/)
+      if (!m) continue
+      let raw = m[2].trim()
+      if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) raw = raw.slice(1, -1)
+      else if (raw === 'true') raw = true
+      else if (raw === 'false') raw = false
+      else if (/^-?\d+(\.\d+)?$/.test(raw)) raw = Number(raw)
+      out[m[1]] = raw
+    }
+    return out
+  } catch { return null }
+}
+
 // ── Shared helpers (ported from skills-management so conventions match) ──
 
 function dshHome() { return process.env.DSH_HOME ? resolve(process.env.DSH_HOME) : join(homedir(), '.dsh') }
@@ -1309,12 +1383,14 @@ function createAgentRunJob({ prompt, dir, jobs, logger, sessions, token, onFinis
 module.exports = {
   name: 'dsh-sync',
   inject: ['webServer', 'settings', 'connection'],
+  Config,
   __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud,
     // remote backup browser（导出供测试）
     BROWSE_REF, logicalSpec, parseRemotePath, categoryForLogical, pullSafety, parseLsTree, fetchBrowseRef, browseRemote, browseRemoteTree, expandToBlobs, planRemotePull, applyRemotePullPlan,
     // apiproxy（导出供测试：mock fetch 驱动 wire 形态回归）
     apiproxy, apiproxyCall, apiproxyLegacy, mintCookie,
-    __setConnection(svc) { connectionSvcRef = svc }, __resetApiproxyCache() { authedUrlCache = null; cookieCache = null } },
+    __setConnection(svc) { connectionSvcRef = svc }, __resetApiproxyCache() { authedUrlCache = null; cookieCache = null },
+    syncSettingsSchema, Config, parseLegacySettingsYaml, __seedLegacyYaml },
 
   apply(ctx, config = {}) {
     const dh = dshHome()
@@ -1323,7 +1399,7 @@ module.exports = {
     const stateFile = join(syncDir, 'state.json')
     const lockFile = join(syncDir, '.lock')
 
-    // ── Settings namespace (write-only token, hasToken-only on read) ──
+    // ── 0.1.7 settings 接线 ──
     // 命名空间必须匹配 /^[a-z][a-z0-9-]*$/ —— 点号形式会被 settings 写入通道拒绝
     const SYNC_SETTINGS_NS = 'dsh-sync'
     const baseSettings = () => {
@@ -1333,40 +1409,84 @@ module.exports = {
       if (config.repoUrl !== undefined) base.repoUrl = config.repoUrl
       return base
     }
-    let settingsScope = null
-    const settingsOverrides = {}
-    if (Schema && ctx.settings && typeof ctx.settings.register === 'function') {
+    const settingsOverrides = {} // 进程内兜底：写回缺席/失败时保本次运行一致
+    function readDescriptor() {
       try {
-        settingsScope = ctx.settings.register(SYNC_SETTINGS_NS, Schema.object({
-          repoUrl: Schema.string(),
-          branch: Schema.string(),
-          gitBinary: Schema.string(),
-          autoSync: Schema.boolean(),
-          syncOnStartup: Schema.boolean(),
-          intervalMinutes: Schema.number(),
-          conflictMode: Schema.string(),
-          syncSkills: Schema.boolean(),
-          syncSessions: Schema.boolean(),
-          syncSettings: Schema.boolean(),
-          syncPlugins: Schema.boolean(),
-          skillsStrategy: Schema.string(),
-          sessionsStrategy: Schema.string(),
-          settingsStrategy: Schema.string(),
-          pluginsStrategy: Schema.string(),
-          snapshotSkills: Schema.boolean(),
-          snapshotAuto: Schema.boolean(),
-          snapshotLocalKeep: Schema.number(),
-          token: Schema.string(),
-        }), { base: baseSettings() })
-      } catch (e) { ctx.logger.warn(`dsh-sync: settings register: ${e && e.message}`) }
+        if (!ctx.settings || typeof ctx.settings.describe !== 'function') return null
+        return ctx.settings.describe().find((x) => x.ns === SYNC_SETTINGS_NS) || null
+      } catch { return null }
     }
-    const syncSettings = () => {
-      if (settingsScope && typeof settingsScope.get === 'function') {
-        const v = settingsScope.get()
-        if (v && typeof v === 'object') return { ...baseSettings(), ...v }
+    let liveSettings = {} // settings 文档实时值（document-updated 事件驱动刷新）
+    // apply 时 loader 可能尚未就绪（describe 投影里还没有本插件条目），间隔重试
+    let liveSeen = false
+    function refreshLive(attempt = 0) {
+      const d = readDescriptor()
+      if (d) {
+        if (!liveSeen) try { ctx.logger.info(`dsh-sync: settings 文档投影就绪`) } catch {}
+        liveSeen = true
+        if (d.value && typeof d.value === 'object') liveSettings = d.value
+        return
       }
-      return { ...baseSettings(), ...settingsOverrides }
+      if (attempt < 15) setTimeout(() => { refreshLive(attempt + 1) }, 2000).unref?.()
     }
+    refreshLive()
+    const syncSettings = () => {
+      const doc = (liveSettings && typeof liveSettings === 'object') ? liveSettings : {}
+      const docSync = (doc.sync && typeof doc.sync === 'object') ? doc.sync : {}
+      return { ...baseSettings(), ...docSync, ...settingsOverrides }
+    }
+
+    // 一次性迁移：dsh 0.1.7 把全局 settings.yaml 改名 settings.yaml.imported，
+    // dsh-sync 节（旧版平铺形态）因插件当时尚未导出 Config 而没能迁进 profile，
+    // 私仓 repoUrl/token 与各开关就此丢失。仅在“本 profile 从未写回过”且当前值
+    // 仍为全新默认时执行一次；之后值落在 profile patch 里，本函数自然短路。
+    let migrationSettled = false
+    async function migrateLegacySyncSettings(attempt = 0) {
+      if (migrationSettled) return
+      try {
+        const descriptor = readDescriptor()
+        if (descriptor && descriptor.user && typeof descriptor.user === 'object' && Object.keys(descriptor.user).length > 0) { migrationSettled = true; return }
+        const cur = syncSettings()
+        const pristine = Object.keys(DEFAULT_SYNC_SETTINGS).every((k) => cur[k] === undefined || cur[k] === DEFAULT_SYNC_SETTINGS[k])
+        if (!pristine) { migrationSettled = true; return }
+        const section = parseLegacySettingsYaml(readLegacyYaml())
+        if (!section) { migrationSettled = true; return }
+        const values = {}
+        for (const k of Object.keys(DEFAULT_SYNC_SETTINGS)) {
+          const v = section[k]
+          if (v === undefined) continue
+          if (typeof DEFAULT_SYNC_SETTINGS[k] === 'boolean' && typeof v === 'boolean') values[k] = v
+          else if (typeof DEFAULT_SYNC_SETTINGS[k] === 'number' && typeof v === 'number' && Number.isFinite(v)) values[k] = v
+          else if (typeof DEFAULT_SYNC_SETTINGS[k] === 'string') values[k] = String(v)
+        }
+        if (Object.keys(values).length === 0 || Object.keys(values).every((k) => values[k] === DEFAULT_SYNC_SETTINGS[k])) { migrationSettled = true; return }
+        if (ctx.settings && typeof ctx.settings.update === 'function') {
+          try {
+            await ctx.settings.update(SYNC_SETTINGS_NS, { sync: values })
+            migrationSettled = true
+            refreshLive()
+            try { ctx.logger.warn(`dsh-sync: 已从 settings.yaml.imported 迁移同步设置到 profile`) } catch {}
+            return
+          } catch { /* loader 未就绪 → 走重试 */ }
+        }
+      } catch { /* 迁移失败不影响主流程 */ }
+      if (attempt < 15) setTimeout(() => { migrateLegacySyncSettings(attempt + 1) }, 2000).unref?.()
+    }
+    migrateLegacySyncSettings()
+
+    // settings 文档变更（dsh 自动生成的设置页、本插件面板写回）刷新实时值
+    try {
+      if (ctx.on && typeof ctx.on === 'function') {
+        ctx.effect(() => {
+          const off = ctx.on('settings/document-updated', (ns) => {
+            if (ns !== SYNC_SETTINGS_NS) return
+            const d = readDescriptor()
+            if (d && d.value && typeof d.value === 'object') liveSettings = d.value
+          })
+          return () => { try { off() } catch {} }
+        }, 'dsh-sync: settings watch')
+      }
+    } catch { /* 事件订阅不可用：写回后靠 settingsOverrides 维持本次运行 */ }
 
     // ── State (instanceId + lastSyncedCommit + lastResult) ──
     let state = { instanceId: undefined, lastSyncedCommit: undefined, lastSyncAt: undefined, lastResult: undefined, cloudSnapshots: [], lastAutoSnapshotDate: undefined }
@@ -1669,16 +1789,24 @@ module.exports = {
             }
             if (typeof body.intervalMinutes === 'number' && body.intervalMinutes >= 1) patch.intervalMinutes = body.intervalMinutes
             // token: non-empty sets; null/'' clears. Never echoed.
+            let clearToken = false
             if (typeof body.token === 'string' && body.token !== '') patch.token = body.token
-            if (body.token === null || body.token === '') patch.token = undefined
+            if (body.token === null || body.token === '') clearToken = true
             // 私仓硬校验：带 repoUrl+token（首次或换仓库）时拒绝公共仓库
             if (patch.token && (patch.repoUrl || syncSettings().repoUrl)) {
               const checkUrl = patch.repoUrl || syncSettings().repoUrl
               const check = await checkRepoPrivate(patch.token, checkUrl)
               if (!check.ok) { sendJson(res, 400, { error: check.error, isPublic: !!check.isPublic }); return }
             }
-            if (settingsScope && typeof settingsScope.update === 'function') await settingsScope.update(patch)
+            if (clearToken) delete settingsOverrides.token
             else Object.assign(settingsOverrides, patch)
+            // 0.1.7 持久化：平铺 patch 挂进 sync: 子对象；token 清空走 mutate.unset
+            if (ctx.settings && typeof ctx.settings.update === 'function') {
+              try {
+                if (Object.keys(patch).length > 0) await ctx.settings.update(SYNC_SETTINGS_NS, { sync: patch })
+                if (clearToken) await ctx.settings.mutate(SYNC_SETTINGS_NS, [{ op: 'unset', path: ['sync', 'token'] }])
+              } catch (e) { ctx.logger.warn(`dsh-sync: settings update 失败（仅本次运行生效）: ${e && e.message}`) }
+            }
             const eff = syncSettings()
             const { token, ...safe } = eff
             sendJson(res, 200, { settings: safe, hasToken: typeof token === 'string' && token !== '' })
