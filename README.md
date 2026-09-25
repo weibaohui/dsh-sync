@@ -56,6 +56,7 @@ dsh plugin --profile web add @weibaohui/dsh-sync -w
 
 | 插件版本 | 适配 dsh 版本 | 备注 |
 |---------|--------------|------|
+| 0.3.2 | 0.1.7-rc.2 | 当前版本；修复宿主将 volatile 字段物化为 {} 导致的设置毒化（saneConfigValues 清洗 + 移除 Config 兼容字符串字段） |
 | 0.3.1 | 0.1.7-rc.2 | 当前版本；适配 0.1.7 settings 模型（导出 volatile `Config`，`ctx.settings.update` 持久化），面板改动重启不再丢失 |
 | 0.2.3 | 0.1.7-rc.2 | 已在 @deepseek-ai/dsh@0.1.7-rc.2 下验证运行 |
 | 0.3.0 | 0.1.7-rc.2 | 新增远端备份浏览+选择性拉取+AI对齐+文件预览；已在 @deepseek-ai/dsh@0.1.7-rc.2 下验证运行 |

@@ -119,7 +119,6 @@ try {
   Config = Schema
     ? Schema.object({
       sync: syncSettingsSchema(Schema).volatile(),
-      repoUrl: Schema.string().volatile(), // 旧版平铺形态兼容位
     })
     : null
 } catch { /* schemastery <3.18.4 无 .volatile()：降级为无 Config（设置写回不可用），插件运行不受影响 */ }
@@ -1405,8 +1404,13 @@ module.exports = {
     const baseSettings = () => {
       const cfg = (config.sync && typeof config.sync === 'object') ? config.sync : {}
       const base = { ...DEFAULT_SYNC_SETTINGS }
-      for (const key of Object.keys(base)) if (cfg[key] !== undefined) base[key] = cfg[key]
-      if (config.repoUrl !== undefined) base.repoUrl = config.repoUrl
+      // 0.1.7 config 回写/投影可能给出 null 等异常值：类型不对就走默认，别让同步链路崩掉
+      for (const key of Object.keys(base)) {
+        const v = cfg[key]
+        if (v === undefined || v === null) continue
+        if (typeof base[key] === typeof v) base[key] = v
+      }
+      if (typeof config.repoUrl === 'string' && config.repoUrl !== '') base.repoUrl = config.repoUrl
       return base
     }
     const settingsOverrides = {} // 进程内兜底：写回缺席/失败时保本次运行一致
