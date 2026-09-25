@@ -142,6 +142,34 @@ window.__ModuleLoader__.load({
       outputLabel: '输出',
       repoUrlPlaceholder: 'https://gitcode.com/<owner>/<repo>.git',
       operationFailed: '操作失败',
+      browseRemote: '浏览远端',
+      browseTitle: '浏览远端备份',
+      browseHint: '识别本机与其他机器的备份，选择文件拉取到本地。跨机拉取插件清单和 settings.yaml 会警告（可能导致宿主崩溃），技能文件可安全拉取。写入前自动拍安全快照可回滚。',
+      browseMine: '本机',
+      browseRoot: '根目录',
+      browseEmpty: '远端为空或未同步',
+      browseNoRepo: '影子仓库未初始化，先同步一次',
+      browseSelectHint: '点击文件夹浏览，勾选文件后预览拉取',
+      browseDir: '目录',
+      browsePreview: '预览拉取',
+      browseApply: '应用',
+      browseAppliedN: '将应用 {n} 项',
+      browseWarnedN: '{n} 项警告',
+      browseBlockedN: '已阻止 {n} 项',
+      browseApplyDone: '拉取完成（当前状态已先拍快照），同步已触发',
+      browseSelectSome: '请先勾选要拉取的文件',
+      browseNSelected: '已选 {n} 项',
+      browseBack: '返回',
+      browseUp: '返回上级',
+      remoteAlignBtn: 'AI 对齐',
+      remoteAlignTitle: '远端 AI 对齐',
+      remoteAlignHint: '把选中文件与其他机器的版本做语义合并（逐键/并集），而非整文件覆盖。动手前自动备份本机文件，合并后触发同步。',
+      browseRefresh: '刷新',
+      browseCommit: '远端版本',
+      browsePreview: '预览',
+      browseBinary: '二进制文件，无法预览',
+      browseTruncated: '（内容过长，已截断）',
+      browseLoading: '加载中…',
     }
 
     const EN = {
@@ -213,6 +241,34 @@ window.__ModuleLoader__.load({
       outputLabel: 'Output',
       repoUrlPlaceholder: 'https://gitcode.com/<owner>/<repo>.git',
       operationFailed: 'Operation failed',
+      browseRemote: 'Browse remote',
+      browseTitle: 'Browse remote backups',
+      browseHint: 'Identify this machine and other machines\' backups, select files to pull locally. Cross-machine plugin manifests and settings.yaml pull with a warning (may crash the host); skill files are safe. A safety snapshot is taken before writing for rollback.',
+      browseMine: 'this machine',
+      browseRoot: 'Root',
+      browseEmpty: 'Remote is empty or not synced',
+      browseNoRepo: 'Shadow repo not initialized — sync first',
+      browseSelectHint: 'Click a folder to browse, check files then preview pull',
+      browseDir: 'dir',
+      browsePreview: 'Preview pull',
+      browseApply: 'Apply',
+      browseAppliedN: 'will apply {n}',
+      browseWarnedN: '{n} warned',
+      browseBlockedN: '{n} blocked',
+      browseApplyDone: 'Pull complete (current state snapshotted first); sync triggered',
+      browseSelectSome: 'Select files to pull first',
+      browseNSelected: '{n} selected',
+      browseBack: 'Back',
+      browseUp: 'Up',
+      remoteAlignBtn: 'AI align',
+      remoteAlignTitle: 'Remote AI align',
+      remoteAlignHint: 'Semantically merge selected files with the other machine\'s version (per-key/union) instead of wholesale overwrite. Live files are backed up first, sync triggered after.',
+      browseRefresh: 'Refresh',
+      browseCommit: 'Remote ref',
+      browsePreview: 'Preview',
+      browseBinary: 'Binary file, cannot preview',
+      browseTruncated: '(content too long, truncated)',
+      browseLoading: 'Loading…',
     }
 
     // ── Pure helpers ────────────────────────────────────────────────────────
@@ -314,15 +370,18 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'sk-toast' }, text)
     }
 
-    // ── Agent-run dialog: action-button pattern for two modes ──
-    //    conflict: user opens it, then clicks run (needs pending PR info)
-    //    align:    parent already POSTed (which ran a deterministic sync first),
-    //              dialog opens with the job streaming and the both-modified list
-    //    Both poll the same shape of job endpoint and can open the agent session.
+    // ── Agent-run dialog: action-button pattern for three modes ──
+    //    conflict:    user opens it, then clicks run (needs pending PR info)
+    //    align:       parent already POSTed (which ran a deterministic sync first),
+    //                 dialog opens with the job streaming and the both-modified list
+    //    remoteAlign: parent (BrowseRemoteDialog) already POSTed, dialog opens
+    //                 with the job streaming and the cross-machine file list
+    //    All poll the same shape of job endpoint and can open the agent session.
 
     function AgentRunDialog({ t, mode, pending, initial, onClose, onToast }) {
       const align = mode === 'align'
-      const endpoint = align ? API + '/align/run' : API + '/conflict/run'
+      const remoteAlign = mode === 'remote-align'
+      const endpoint = remoteAlign ? API + '/remote/align' : (align ? API + '/align/run' : API + '/conflict/run')
       const [job, setJob] = useState(initial && initial.jobId ? { jobId: initial.jobId, status: 'running', output: '', code: null } : null)
       const [busy, setBusy] = useState(false)
       useEffect(() => {
@@ -356,13 +415,16 @@ window.__ModuleLoader__.load({
       const row = (label, value) => h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 12, padding: '3px 0' } },
         h('span', { className: 'sk-dir' }, label), h('span', { className: 'sk-hint', style: { wordBreak: 'break-all', textAlign: 'right' } }, value))
       const files = initial && Array.isArray(initial.bothModified) ? initial.bothModified : null
-      return h(SkDialog, { title: align ? t('alignTitle') : t('conflictTitle'), onClose, wide: true },
+      const showFileList = align || remoteAlign
+      const title = remoteAlign ? t('remoteAlignTitle') : (align ? t('alignTitle') : t('conflictTitle'))
+      const hint = remoteAlign ? t('remoteAlignHint') : (align ? t('alignHint') : t('conflictHint'))
+      return h(SkDialog, { title, onClose, wide: true },
         h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10, minWidth: 380 } },
-          h('div', { className: 'sk-hint' }, align ? t('alignHint') : t('conflictHint')),
-          !align && pending && h('div', null,
+          h('div', { className: 'sk-hint' }, hint),
+          !align && !remoteAlign && pending && h('div', null,
             row('PR', '#' + (pending.prNumber || '-')),
             row('Branch', pending.branch || '-')),
-          align && h('div', { className: 'sk-card' },
+          showFileList && h('div', { className: 'sk-card' },
             h('div', { className: 'sk-dir', style: { marginBottom: 4 } }, t('alignFiles')),
             files && files.length
               ? h('pre', { style: { margin: 0, whiteSpace: 'pre-wrap', fontSize: 12, maxHeight: 120, overflow: 'auto' } }, files.join('\n'))
@@ -375,8 +437,220 @@ window.__ModuleLoader__.load({
               job.output || '…')),
           h('div', { className: 'sk-dlg-foot', style: { marginTop: 0 } },
             job !== null && job.sessionId && sessionsSvc() && h(ButtonLite, { onClick: openChat }, t('openChat')),
-            !align && h(ButtonLite, { primary: true, disabled: busy || (job !== null && job.status === 'running'), onClick: doRun },
+            !align && !remoteAlign && h(ButtonLite, { primary: true, disabled: busy || (job !== null && job.status === 'running'), onClick: doRun },
               job !== null && job.status === 'running' ? t('running') : t('resolveBtn')))))
+    }
+
+    // ── Remote backup browser dialog: browse the remote tree, identify which
+    //    machine each backup belongs to, select files to pull. Two-phase pull:
+    //    preview (dry-run plan with safety decisions) → apply (writes to live
+    //    with a pre-pull safety snapshot). Plugin manifests and settings.yaml
+    //    from another machine are blocked server-side (crash guard).
+
+    function BrowseRemoteDialog({ t, onClose, onToast }) {
+      const [browse, setBrowse] = useState(null)
+      const [tree, setTree] = useState(null)
+      const [selected, setSelected] = useState({})
+      const [preview, setPreview] = useState(null)
+      const [busy, setBusy] = useState(false)
+      const [applying, setApplying] = useState(false)
+      const [alignOpen, setAlignOpen] = useState(false)
+      const [alignInitial, setAlignInitial] = useState(null)
+      const [filePreview, setFilePreview] = useState(null)
+
+      const refreshBrowse = () => {
+        setBusy(true); setPreview(null); setSelected({}); setFilePreview(null)
+        getJson(API + '/remote/browse').then(d => {
+          setBrowse(d)
+          setTree({ path: '', entries: d.rootEntries || [] })
+        }).catch(e => onToast(e.message || t('operationFailed'), 4000))
+          .finally(() => setBusy(false))
+      }
+      useEffect(() => { refreshBrowse() }, [])
+
+      const navigateTo = (path) => {
+        if (!path) { refreshBrowse(); return }
+        setBusy(true); setPreview(null); setSelected({}); setFilePreview(null)
+        getJson(API + '/remote/tree?path=' + encodeURIComponent(path)).then(d => {
+          if (d.repoReady === false) { onToast(t('browseNoRepo'), 3500); return }
+          if (d.fetchOk === false) { onToast(t('browseEmpty'), 3500); return }
+          setTree(d)
+        }).catch(e => onToast(e.message || t('operationFailed'), 3000))
+          .finally(() => setBusy(false))
+      }
+
+      const previewFile = (path) => {
+        setFilePreview({ path, loading: true })
+        getJson(API + '/remote/preview?path=' + encodeURIComponent(path)).then(d => {
+          setFilePreview(d)
+        }).catch(e => { setFilePreview(null); onToast(e.message || t('operationFailed'), 3000) })
+      }
+
+      const fullPath = (name) => tree && tree.path ? tree.path + '/' + name : name
+      const toggleSelect = (name) => {
+        const fp = fullPath(name)
+        setSelected(prev => { const n = { ...prev }; if (n[fp]) delete n[fp]; else n[fp] = true; return n })
+      }
+      const selectedCount = Object.keys(selected).length
+
+      const doPreview = async () => {
+        const paths = Object.keys(selected)
+        if (!paths.length) { onToast(t('browseSelectSome'), 2500); return }
+        setBusy(true)
+        try {
+          const r = await fetch(API + '/remote/pull', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paths, apply: false }) })
+          const d = await r.json().catch(() => ({}))
+          if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
+          setPreview(d)
+        } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
+        finally { setBusy(false) }
+      }
+
+      const doApply = async () => {
+        const paths = Object.keys(selected)
+        setApplying(true)
+        try {
+          const r = await fetch(API + '/remote/pull', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paths, apply: true }) })
+          const d = await r.json().catch(() => ({}))
+          if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
+          onToast(t('browseApplyDone'), 3500)
+          setPreview(null); setSelected({})
+          refreshBrowse()
+        } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
+        finally { setApplying(false) }
+      }
+
+      const doRemoteAlign = async () => {
+        const paths = Object.keys(selected)
+        if (!paths.length) { onToast(t('browseSelectSome'), 2500); return }
+        setBusy(true)
+        try {
+          const r = await fetch(API + '/remote/align', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paths }) })
+          const d = await r.json().catch(() => ({}))
+          if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
+          setAlignInitial({ jobId: d.jobId, bothModified: d.bothModified || [], backupDir: d.backupDir })
+          setAlignOpen(true)
+        } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
+        finally { setBusy(false) }
+      }
+
+      const segments = tree && tree.path ? tree.path.split('/').filter(Boolean) : []
+      const instChips = browse && browse.instances ? browse.instances : []
+      const entries = tree ? (tree.entries || []) : []
+      const applyCount = preview ? preview.applyCount : 0
+      const blockCount = preview ? preview.blockCount : 0
+      const warnCount = preview ? preview.warnCount : 0
+
+      // Build sub-sections as variables to avoid deeply-nested ternary parens.
+      const isInstActive = (instId) => tree && tree.path && tree.path.startsWith('backup/' + instId)
+      // 本机 tag 用绿色（success），选中态用蓝色加粗描边——两色截然不同
+      const mineStyle = { color: 'var(--dsw-alias-state-success-primary, #16a34a)', borderColor: 'var(--dsw-alias-state-success-primary, #16a34a)' }
+      const activeStyle = { fontWeight: 700, borderColor: 'var(--dsh-alias-state-business-primary)', borderWidth: '2px' }
+      const instChipsEl = instChips.length > 0
+        ? h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' } },
+            instChips.map(inst => h('button', {
+              key: inst.id,
+              className: 'sk-tag',
+              style: {
+                cursor: 'pointer', background: 'transparent',
+                ...(inst.isMine ? mineStyle : {}),
+                ...(isInstActive(inst.id) ? activeStyle : {}),
+              },
+              onClick: () => navigateTo('backup/' + inst.id),
+            }, inst.id + (inst.isMine ? ' · ' + t('browseMine') : ''))),
+            h('button', {
+              className: 'sk-tag',
+              style: { cursor: 'pointer', background: 'transparent', ...(tree && !tree.path ? activeStyle : {}) },
+              onClick: () => navigateTo(''),
+            }, t('browseRoot')))
+        : null
+
+      // commit hash + 刷新按钮：让用户知道数据来源版本
+      const commitBar = browse && browse.lastCommit
+        ? h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 } },
+            h('span', { className: 'sk-dir' }, t('browseCommit') + ': ' + String(browse.lastCommit).slice(0, 8)),
+            busy && h('div', { className: 'sk-spin', style: { width: 14, height: 14, borderWidth: 2 } }),
+            h('span', { className: 'sk-spacer' }),
+            h(ButtonLite, { small: true, disabled: busy, onClick: refreshBrowse }, t('browseRefresh')))
+        : null
+
+      const crumb = h('div', { style: { display: 'flex', alignItems: 'center', gap: 2, flexWrap: 'wrap' } },
+        h('button', { className: 'sk-dir', style: { cursor: 'pointer', background: 'transparent', border: 'none', padding: 0 }, onClick: () => navigateTo('') }, t('browseRoot')),
+        segments.map((seg, i) => h('span', { key: i, style: { display: 'flex', alignItems: 'center', gap: 2 } },
+          h('span', { className: 'sk-dir' }, '/'),
+          h('button', { className: 'sk-dir', style: { cursor: 'pointer', background: 'transparent', border: 'none', padding: 0 }, onClick: () => navigateTo(segments.slice(0, i + 1).join('/')) }, seg))),
+        tree && tree.path && h('button', { className: 'sk-dir', style: { cursor: 'pointer', background: 'transparent', border: 'none', padding: 0, marginLeft: 4 }, onClick: () => navigateTo(segments.slice(0, -1).join('/')) }, '↑ ' + t('browseUp')))
+
+      const entryList = entries.length === 0
+        ? h('div', { className: 'sk-hint', style: { padding: 12 } }, t('browseEmpty'))
+        : h('div', { style: { maxHeight: 240, overflow: 'auto', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 8 } },
+            entries.map(e => {
+              const fp = fullPath(e.name)
+              const isPreviewing = filePreview && filePreview.path === fp
+              return h('div', { key: e.name, style: { display: 'flex', alignItems: 'center', gap: 8, padding: '5px 8px', borderBottom: '1px solid var(--dsw-alias-border-l1)', ...(isPreviewing ? { background: 'var(--dsw-alias-interactive-bg-hover)' } : {}) } },
+                h('input', { type: 'checkbox', checked: !!selected[fp], onChange: () => toggleSelect(e.name) }),
+                e.type === 'tree'
+                  ? h('button', { style: { cursor: 'pointer', background: 'transparent', border: 'none', color: 'var(--dsw-alias-state-business-primary)', padding: 0, fontSize: 13, fontFamily: 'var(--dsw-font-family)' }, onClick: () => navigateTo(fp) }, '📁 ' + e.name)
+                  : h('button', { style: { cursor: 'pointer', background: 'transparent', border: 'none', color: isPreviewing ? 'var(--dsw-alias-state-business-primary)' : 'var(--dsw-alias-label-primary)', padding: 0, fontSize: 13, fontFamily: 'var(--dsw-font-family)' }, onClick: () => previewFile(fp) }, '📄 ' + e.name))
+            }))
+
+      // 文件预览面板：点击文件名后显示内容
+      const filePreviewEl = filePreview && h('div', { className: 'sk-card', style: { maxHeight: 200, overflow: 'auto', padding: '8px 12px' } },
+        h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 } },
+          h('span', { className: 'sk-dir', style: { wordBreak: 'break-all' } }, filePreview.path),
+          filePreview.size != null && h('span', { className: 'sk-dir', style: { flexShrink: 0 } }, filePreview.size + ' B'),
+          h('button', { style: { cursor: 'pointer', background: 'transparent', border: 'none', color: 'var(--dsw-alias-label-tertiary)', fontSize: 14, padding: '0 4px' }, onClick: () => setFilePreview(null) }, '✕')),
+        filePreview.loading
+          ? h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, padding: 8 } }, h('div', { className: 'sk-spin', style: { width: 14, height: 14, borderWidth: 2 } }), t('browseLoading'))
+          : filePreview.binary
+            ? h('div', { className: 'sk-hint' }, t('browseBinary'))
+            : h('pre', { style: { margin: 0, whiteSpace: 'pre-wrap', fontSize: 11.5, lineHeight: 1.4, fontFamily: 'var(--dsw-font-family)' } },
+                filePreview.content || '', filePreview.truncated && h('span', { className: 'sk-dir' }, '\n' + t('browseTruncated'))))
+
+      const browseBody = browse === null
+        ? h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, padding: 20 } }, h('div', { className: 'sk-spin' }), '…')
+        : browse.repoReady === false
+          ? h('div', { className: 'sk-hint', style: { padding: 12 } }, t('browseNoRepo'))
+          : browse.fetchOk === false
+            ? h('div', { className: 'sk-hint', style: { padding: 12 } }, t('browseEmpty'))
+            : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
+                instChipsEl, commitBar, crumb,
+                h('div', { className: 'sk-dir' }, t('browseSelectHint')),
+                entryList, filePreviewEl)
+
+      const previewEl = preview && h('div', { className: 'sk-card' },
+        h('div', { style: { display: 'flex', gap: 10, marginBottom: 6 } },
+          h(Tag, { tone: 'accent' }, t('browseAppliedN', { n: applyCount })),
+          warnCount > 0 && h(Tag, { tone: 'danger' }, t('browseWarnedN', { n: warnCount })),
+          blockCount > 0 && h(Tag, { tone: 'danger' }, t('browseBlockedN', { n: blockCount }))),
+        preview.plan && preview.plan.length > 0 && h('div', { style: { maxHeight: 180, overflow: 'auto', fontSize: 12, lineHeight: 1.5 } },
+          preview.plan.map((p, i) => h('div', { key: i, style: { padding: '2px 0', display: 'flex', gap: 6, alignItems: 'flex-start' } },
+            h('span', { style: { color: p.action === 'block' ? 'var(--dsw-alias-state-error-primary)' : p.warn ? 'var(--dsw-alias-state-warning-primary, #e6a700)' : 'var(--dsw-alias-state-business-primary)', flexShrink: 0 } }, p.action === 'block' ? '✗' : p.warn ? '⚠' : '✓'),
+            h('span', { style: { flex: 1, wordBreak: 'break-all' } }, p.remotePath,
+              p.livePath && h('span', { className: 'sk-dir', style: { display: 'block', fontSize: 11 } }, '→ ' + p.livePath)),
+            p.warn && h('span', { className: 'sk-dir', style: { maxWidth: '55%', flexShrink: 0, color: 'var(--dsw-alias-state-warning-primary, #e6a700)' } }, p.warn),
+            p.action === 'block' && h('span', { className: 'sk-dir', style: { maxWidth: '55%', flexShrink: 0 } }, p.reason)))))
+
+      const applyLabel = applying ? '…' : t('browseApply') + ' (' + applyCount + ')'
+      const footer = h('div', { className: 'sk-dlg-foot' },
+        h('span', { className: 'sk-dir' }, t('browseNSelected', { n: selectedCount })),
+        h('span', { className: 'sk-spacer' }),
+        h(ButtonLite, { onClick: onClose }, t('browseBack')),
+        // 有警告项时多一个「AI 对齐」按钮：语义合并而非整文件覆盖
+        preview && warnCount > 0 && h(ButtonLite, { disabled: busy || applying, onClick: doRemoteAlign }, t('remoteAlignBtn')),
+        preview
+          ? h(ButtonLite, { primary: true, disabled: applying || applyCount === 0, onClick: doApply }, applyLabel)
+          : h(ButtonLite, { primary: true, disabled: busy || selectedCount === 0, onClick: doPreview }, t('browsePreview')))
+
+      return h('div', null,
+        h(SkDialog, { title: t('browseTitle'), onClose, wide: true },
+          h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10, minWidth: 400, maxWidth: 720 } },
+            h('div', { className: 'sk-hint' }, t('browseHint')),
+            browseBody, previewEl, footer)),
+        alignOpen && h(AgentRunDialog, {
+          t, mode: 'remote-align', initial: alignInitial,
+          onClose: () => { setAlignOpen(false); refreshBrowse() }, onToast,
+        }))
     }
 
     // ── Settings section: the single entrance (host settings page section) ──
@@ -403,6 +677,7 @@ window.__ModuleLoader__.load({
       const [snapName, setSnapName] = useState('')
       const [snapCloud, setSnapCloud] = useState(false)
       const [snapBusy, setSnapBusy] = useState(false)
+      const [browseOpen, setBrowseOpen] = useState(false)
 
       const onToast = (text, ms = 3000) => { setToastText(text); setTimeout(() => setToastText(null), ms) }
       const refresh = () => getJson(API + '/status').then(d => {
@@ -593,6 +868,7 @@ window.__ModuleLoader__.load({
                 h('div', { className: 'sk-dir', style: { marginTop: 4 } }, t('conflictModeHint'))),
               h('div', { className: 'sk-toolbar' },
                 h(ButtonLite, { onClick: doSave }, t('save')),
+                h(ButtonLite, { disabled: !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : undefined, onClick: () => setBrowseOpen(true) }, t('browseRemote')),
                 h('span', { className: 'sk-spacer' }),
                 h(ButtonLite, {
                   disabled: alignBusy || status.syncing || !status.repoUrl || !status.hasToken,
@@ -613,6 +889,9 @@ window.__ModuleLoader__.load({
         }),
         alignOpen && h(AgentRunDialog, {
           t, mode: 'align', initial: alignInitial, onClose: () => setAlignOpen(false), onToast,
+        }),
+        browseOpen && h(BrowseRemoteDialog, {
+          t, onClose: () => setBrowseOpen(false), onToast,
         }),
         toastText && h(InToast, { text: toastText }),
       )
