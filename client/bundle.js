@@ -65,7 +65,8 @@ window.__ModuleLoader__.load({
 
     // Sessions service (client runtime): opens the conflict run's conversation
     // in the real UI. Resolved through dynamic ctx.inject; absence degrades the
-    // 打开对话 button to hidden.
+    // 打开对话 button to hidden. dsh 0.1.7 removed sessions.open() — navigation
+    // moved to uiWorkspace.openSession(); both faces are normalized to { open(id) }.
     let sessionsApi = null
     const sessionsSvc = () => sessionsApi
 
@@ -927,6 +928,14 @@ window.__ModuleLoader__.load({
             ctx.inject(['sessions'], (scope) => {
               const svc = scope && scope.sessions
               if (svc && typeof svc.open === 'function') sessionsApi = svc
+            })
+            // dsh 0.1.7+: sessions.open() 被移除，会话导航改走
+            // uiWorkspace.openSession()。归一成 { open(id) } 面孔，调用点不变。
+            ctx.inject(['uiWorkspace'], (scope) => {
+              const svc = scope && scope.uiWorkspace
+              if (svc && typeof svc.openSession === 'function' && !sessionsApi) {
+                sessionsApi = { open: (id) => svc.openSession(id) }
+              }
             })
           }
         } catch {}
