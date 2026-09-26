@@ -5,7 +5,7 @@
 
 **多机同步插件**：让多台机器上的 dsh 通过一个私有 GitCode 仓库保持一致——技能、会话、设置、插件清单都能同步。
 
-![多机同步：仓库配置、同步开关与冲突处理](docs/demo.gif)
+![多机同步：仓库配置、同步开关与冲突处理](https://raw.githubusercontent.com/weibaohui/dsh-sync/main/docs/demo.gif)
 
 ## 核心功能
 
