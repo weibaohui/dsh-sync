@@ -27,6 +27,21 @@ const mkdtemp = async () => {
   const d = await fsp.mkdtemp(join(tmpdir(), 'dshsync-'))
   return d
 }
+// 用 POSIX sh 驱动 askpass 助手：POSIX 上是 /bin/sh；Windows 上是 Git for Windows 自带的
+// usr/bin/sh.exe（在 PATH 里 git.exe 所在目录的上一层兄弟目录），都没有则跳过该用例。
+function findPosixSh() {
+  if (process.platform !== 'win32') return fs.existsSync('/bin/sh') ? '/bin/sh' : null
+  for (const dir of String(process.env.PATH || '').split(';')) {
+    if (!dir || !fs.existsSync(join(dir, 'git.exe'))) continue
+    const root = join(dir, '..')
+    for (const rel of [['usr', 'bin', 'sh.exe'], ['bin', 'sh.exe']]) {
+      const c = join(root, ...rel)
+      if (fs.existsSync(c)) return c
+    }
+  }
+  return null
+}
+const posixSh = findPosixSh()
 
 // ── Pure helpers ────────────────────────────────────────────────────────
 
@@ -37,7 +52,7 @@ test('parseRepoUrl handles gitcode urls', () => {
   assert.equal(I.parseRepoUrl('not a url'), null)
 })
 
-test('git auth travels via GIT_ASKPASS env, never argv (issue #9)', async () => {
+test('git auth travels via GIT_ASKPASS env, never argv (issue #9)', { skip: posixSh ? false : 'POSIX sh 不可用（未安装 Git for Windows 的 usr/bin/sh.exe）' }, async () => {
   // no token configured → no env injection (public/local remotes)
   assert.equal(I.gitAuthEnv({ token: '' }), undefined)
   assert.equal(I.gitAuthEnv(undefined), undefined)
@@ -52,7 +67,7 @@ test('git auth travels via GIT_ASKPASS env, never argv (issue #9)', async () => 
     assert.ok(env.GIT_ASKPASS.endsWith('.askpass.sh'), 'GIT_ASKPASS must point at the installed helper')
     // the helper answers git's credential prompts: username → oauth2, password → $DSH_SYNC_TOKEN
     const run = (prompt) => new Promise((res, rej) => {
-      execFile('/bin/sh', [env.GIT_ASKPASS, prompt], { env: { ...process.env, DSH_SYNC_TOKEN: 'sekret' } }, (e, o) => e ? rej(e) : res(String(o).trim()))
+      execFile(posixSh, [env.GIT_ASKPASS, prompt], { env: { ...process.env, DSH_SYNC_TOKEN: 'sekret' } }, (e, o) => e ? rej(e) : res(String(o).trim()))
     })
     assert.equal(await run("Username for 'https://gitcode.com': "), 'oauth2')
     assert.equal(await run("Password for 'https://oauth2@gitcode.com': "), 'sekret')
@@ -769,3 +784,18 @@ test('promoteSnapshotToCloud: bare remote gets snapshot tree on pushed branch', 
     await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {})
   }
 })
+
+// 0.4.5：askpass 的用户名要按 provider 走（GitHub HTTPS 不接受任意用户名）。
+// 这里只做纯函数/脚本文本断言——真正执行 sh 的用例在本沙箱里会 spawn EPERM。
+test('askpass username: provider-specific, script keeps the DSH_SYNC_USER hook', () => {
+  assert.equal(I.gitUsernameForProvider('https://github.com/o/r.git'), 'x-access-token')
+  assert.equal(I.gitUsernameForProvider('https://gitcode.com/o/r.git'), 'oauth2')
+  assert.equal(I.gitUsernameForProvider('https://git.internal.corp/o/r.git'), 'oauth2')
+  const env = I.gitAuthEnv({ token: 'sekret', repoUrl: 'https://github.com/o/r.git' })
+  assert.equal(env.DSH_SYNC_USER, 'x-access-token')
+  assert.equal(env.DSH_SYNC_TOKEN, 'sekret')
+  assert.ok(I.ASKPASS_SH.includes('${DSH_SYNC_USER:-oauth2}'), 'askpass 默认用户名必须可被 DSH_SYNC_USER 覆盖')
+  assert.ok(I.ASKPASS_SH.includes('$DSH_SYNC_TOKEN'))
+  assert.ok(!I.ASKPASS_SH.includes('sekret'), '脚本里不得内嵌任何字面 token')
+})
+

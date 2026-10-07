@@ -72,6 +72,27 @@ const ZH = {
   syncFailed: '同步失败',
   save: '保存',
   saved: '设置已保存',
+  savedLocalOnly: '设置已保存到本地（宿主设置写回失败，重启后仍生效）',
+  savedNothing: '没有可保存的修改（空字段已跳过）',
+  statusError: '状态读取失败',
+  retry: '重试',
+  clearRepoUrl: '清空',
+  clearRepoUrlConfirm: '确定清空仓库地址？清空后定时同步会失败，直到重新填写并保存。',
+  providerLabel: '仓库托管方',
+  provider_gitcode: 'GitCode',
+  provider_github: 'GitHub',
+  provider_gitlab: 'GitLab',
+  provider_gitee: 'Gitee',
+  provider_other: '其他/自建',
+  providerOtherRisk: '自建或未知主机无法自动校验仓库是否私有，保存前请自行确认。',
+  providerUnverified: '未校验托管方（{host}）',
+  riskTitle: '无法校验仓库是否为私有',
+  riskGate: '「私仓校验」是防泄露的唯一闸门，而它只对已支持的托管方（GitCode/GitHub/GitLab/Gitee）有效。',
+  riskBody: '{host} 属于自建/未知主机，无法判定该仓库是私有还是公开。',
+  riskLeak: '如果是公开仓库，上传后有密钥泄露危险：同步的 settings 组会整文件上传本机 ~/.dsh/settings.yaml（可能含其它插件的明文密钥）。请确认该仓库是私有仓库，并接受此风险后再继续。',
+  riskConfirm: '确认是私有仓库，继续保存',
+  close: '取消',
+  savedUnverified: '已保存（该托管方无法校验私有性，风险已由你确认）',
   repoUrlLabel: '仓库地址',
   branchLabel: '分支',
   instanceLabel: '实例 ID',
@@ -199,6 +220,27 @@ const EN = {
   syncFailed: 'Sync failed',
   save: 'Save',
   saved: 'Settings saved',
+  savedLocalOnly: 'Saved locally (host write-back failed; still applies after restart)',
+  savedNothing: 'Nothing to save (empty fields were skipped)',
+  statusError: 'Status request failed',
+  retry: 'Retry',
+  clearRepoUrl: 'Clear',
+  clearRepoUrlConfirm: 'Clear the repository URL? Scheduled sync will fail until you fill it in again.',
+  providerLabel: 'Hosting provider',
+  provider_gitcode: 'GitCode',
+  provider_github: 'GitHub',
+  provider_gitlab: 'GitLab',
+  provider_gitee: 'Gitee',
+  provider_other: 'Other/self-hosted',
+  providerOtherRisk: 'A self-hosted or unknown host cannot be checked for privacy automatically — verify it yourself before saving.',
+  providerUnverified: 'Provider not verified ({host})',
+  riskTitle: 'Cannot verify the repository is private',
+  riskGate: 'The private-repo check is the only gate against leaking credentials, and it only works for the supported hosts (GitCode/GitHub/GitLab/Gitee).',
+  riskBody: '{host} is self-hosted or unknown, so we cannot tell whether that repository is private or public.',
+  riskLeak: 'If it is public, uploading leaks secrets: the settings group mirrors this machine\'s ~/.dsh/settings.yaml wholesale (other plugins may keep plaintext keys there). Confirm the repo is private and accept this risk before continuing.',
+  riskConfirm: 'It is private — save anyway',
+  close: 'Cancel',
+  savedUnverified: 'Saved (privacy could not be verified; you accepted the risk)',
   repoUrlLabel: 'Repository URL',
   branchLabel: 'Branch',
   instanceLabel: 'Instance ID',
@@ -390,7 +432,17 @@ const STYLE = `<style>
 
 async function getJson(url) {
   const r = await fetch(url)
-  if (!r.ok) throw new Error('HTTP ' + r.status)
+  if (!r.ok) {
+    // Surface the server's own message (e.g. git's "! [rejected] (non-fast-forward)")
+    // instead of a bare status code; the API returns { error } for failures.
+    let msg = 'HTTP ' + r.status
+    try {
+      const d = await r.json()
+      if (d && d.error) msg = String(d.error)
+      else if (d && d.code) msg = String(d.code)
+    } catch { /* body not JSON — keep the status code */ }
+    throw new Error(msg.length > 300 ? msg.slice(0, 300) + '…' : msg)
+  }
   return r.json()
 }
 
@@ -706,6 +758,15 @@ function BrowseRemoteDialog({ t, onClose, onToast }) {
 
 // ── Settings section: the single entrance (host settings page section) ──
 
+// Provider 按钮组：默认 GitCode（点选只改地址前缀，保留已填的 owner/repo 路径）。
+const REPO_PROVIDERS = [
+  { id: 'gitcode', host: 'https://gitcode.com/' },
+  { id: 'github', host: 'https://github.com/' },
+  { id: 'gitlab', host: 'https://gitlab.com/' },
+  { id: 'gitee', host: 'https://gitee.com/' },
+  { id: 'other', host: '' },
+]
+
 function SettingsSection({ t }) {
   const [status, setStatus] = useState(null)
   const [busy, setBusy] = useState(false)
@@ -739,15 +800,27 @@ function SettingsSection({ t }) {
   const [testBusy, setTestBusy] = useState(null)
   const [testOut, setTestOut] = useState({})
   const loadedRef = useRef(false)
+  const rootRef = useRef(null)
+  // 用户是否动过表单：动过之后 15s 轮询不再回写输入框（保护正在编辑的内容），
+  // 保存成功后清零，下一个轮询周期恢复"服务端值 → 表单"的同步。
+  const dirtyRef = useRef(false)
+  const [statusError, setStatusError] = useState(null)
+  // 当前选中的托管方（按钮组回显）；'other' = 自建/未知主机，保存时要风险确认
+  const [providerChoice, setProviderChoice] = useState('gitcode')
+  const [risk, setRisk] = useState(null)
 
   const onToast = (text, ms = 3000) => { setToastText(text); setTimeout(() => setToastText(null), ms) }
-  // 首次加载用服务端值填充表单；之后的 15s 轮询只刷新 status，不回写输入框
-  //（避免把用户正在编辑的内容冲掉）
+  // 服务端值回填表单：每次成功轮询都回填，但只在用户没动过表单时（dirtyRef 由
+  // 根节点上的原生 input/change 捕获监听置位）。旧实现只在首次成功时回填，
+  // 首次请求失败就永远是空表单，这正是"面板看着像没保存"的一半原因。
+  // 失败也不再静默：记 statusError 并在顶部给重试入口。
   const refresh = () => getJson(API + '/status').then(d => {
     setStatus(d)
-    if (!loadedRef.current) {
+    setStatusError(null)
+    if (!loadedRef.current || !dirtyRef.current) {
       loadedRef.current = true
       setRepoUrl(d.repoUrl || '')
+      if (d.provider && d.provider.kind && d.provider.kind !== 'none') setProviderChoice(d.provider.kind === 'generic' ? 'other' : d.provider.kind)
       setBranch(d.branch || '')
       setIntervalMinutes(d.intervalMinutes || 30)
       setAutoSync(d.autoSync !== false)
@@ -765,12 +838,25 @@ function SettingsSection({ t }) {
       if (pr.local) { setLocOn(!!pr.local.enabled); setLocDir(pr.local.dir || '') }
     }
     getJson(API + '/snapshot/list').then(l => setSnapList(l)).catch(() => {})
-  }).catch(() => {})
+  }).catch(e => { setStatusError(String((e && e.message) || e)) })
   useEffect(() => {
     refresh()
     const timer = setInterval(refresh, 15000)
     if (typeof timer.unref === 'function') timer.unref()
     return () => clearInterval(timer)
+  }, [])
+  // 用原生监听而不是 React 的 onChangeCapture：面板里任何 input/change 都算
+  // "用户开始编辑"，此后轮询只刷新状态行，不再覆盖表单值。
+  useEffect(() => {
+    const el = rootRef.current
+    if (!el || typeof el.addEventListener !== 'function') return
+    const mark = () => { dirtyRef.current = true }
+    el.addEventListener('input', mark, true)
+    el.addEventListener('change', mark, true)
+    return () => {
+      el.removeEventListener('input', mark, true)
+      el.removeEventListener('change', mark, true)
+    }
   }, [])
 
   const doSync = async () => {
@@ -800,26 +886,78 @@ function SettingsSection({ t }) {
   const putSettings = async (patch) => {
     const r = await fetch(API + '/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) })
     const d = await r.json().catch(() => ({}))
-    if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
+    if (!r.ok) {
+      const err = new Error(d.error || 'HTTP ' + r.status)
+      err.payload = d // needConfirm/UNVERIFIED_REPO 等结构化信息，doSave 据此弹风险确认
+      throw err
+    }
     return d
   }
+  // 切换托管方：只改地址前缀，保留已填的 owner/repo 路径；私有性由服务端按 host 判定
+  const applyProvider = (id) => {
+    const target = REPO_PROVIDERS.find(p => p.id === id)
+    if (!target) return
+    setProviderChoice(id)
+    if (target.host) {
+      const path = String(repoUrl || '').replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]+\//i, '').replace(/^git@[^:]+:/i, '')
+      setRepoUrl(target.host + path)
+    }
+    dirtyRef.current = true
+  }
+  // PUT + 统一成功处理（保存成功后的清空/提示/刷新只在这一次实现）
+  const savePatch = async (patch) => {
+    const res = await putSettings(patch)
+    setToken('')
+    setWdv(prev => ({ ...prev, password: '' }))
+    dirtyRef.current = false
+    const appliedN = res && Array.isArray(res.applied) ? res.applied.length : -1
+    const ignoredN = res && Array.isArray(res.ignored) ? res.ignored.length : 0
+    // 宿主 settings 写回失败时设置只落在插件自持的 settings.json 里：明确告知用户
+    if (res && res.persist && res.persist.hostOk === false) onToast(t('savedLocalOnly'), 5000)
+    // 一个键都没写进去（例如仓库地址还是空的）：不要假装"已保存"
+    else if (appliedN === 0 && ignoredN > 0) onToast(t('savedNothing'), 4200)
+    else onToast(t('saved'), 2200)
+    refresh()
+    return res
+  }
   const doSave = async () => {
+    const patch = {
+      repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode,
+      syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins,
+      skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins,
+      snapshotAuto: snapCfg.auto, snapshotSkills: snapCfg.skills, snapshotLocalKeep: snapCfg.localKeep,
+      gitEnabled: gitOn,
+      webdavEnabled: wdvOn, webdavUrl: wdv.url, webdavUsername: wdv.username, webdavDir: wdv.dir,
+      localEnabled: locOn, localDir: locDir,
+    }
+    if (token !== '') patch.token = token
+    if (wdv.password !== '') patch.webdavPassword = wdv.password
     try {
-      const patch = {
-        repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode,
-        syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins,
-        skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins,
-        snapshotAuto: snapCfg.auto, snapshotSkills: snapCfg.skills, snapshotLocalKeep: snapCfg.localKeep,
-        gitEnabled: gitOn,
-        webdavEnabled: wdvOn, webdavUrl: wdv.url, webdavUsername: wdv.username, webdavDir: wdv.dir,
-        localEnabled: locOn, localDir: locDir,
-      }
-      if (token !== '') patch.token = token
-      if (wdv.password !== '') patch.webdavPassword = wdv.password
-      await putSettings(patch)
-      setToken('')
-      setWdv(prev => ({ ...prev, password: '' }))
-      onToast(t('saved'), 2200)
+      await savePatch(patch)
+    } catch (e) {
+      const p = e && e.payload
+      // 自建/未知主机判不了私有性：不静默放行、也不直接拒绝，交给用户显式确认风险
+      if (p && (p.needConfirm || p.code === 'UNVERIFIED_REPO')) { setRisk({ patch, host: p.host || '', error: p.error || '' }); return }
+      onToast((e && e.message) || t('operationFailed'), 4000)
+    }
+  }
+  // 风险弹窗确认后重发（带 allowUnverifiedRepo；该标记不落盘，每次保存都要重新确认）
+  const confirmRisk = async () => {
+    const r = risk
+    setRisk(null)
+    if (!r) return
+    try { await savePatch({ ...r.patch, allowUnverifiedRepo: true }); onToast(t('savedUnverified'), 5200) }
+    catch (e) { onToast((e && e.message) || t('operationFailed'), 4000) }
+  }
+  // 显式清空仓库地址：空串在 0.4.4 语义里是"保持不变"，清空必须发 null
+  const doClearRepoUrl = async () => {
+    try {
+      if (typeof window !== 'undefined' && typeof window.confirm === 'function' && !window.confirm(t('clearRepoUrlConfirm'))) return
+      const res = await putSettings({ repoUrl: null })
+      setRepoUrl('')
+      dirtyRef.current = false
+      if (res && res.persist && res.persist.hostOk === false) onToast(t('savedLocalOnly'), 5000)
+      else onToast(t('saved'), 2200)
       refresh()
     } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
   }
@@ -967,11 +1105,20 @@ function SettingsSection({ t }) {
       gitOn && h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
         status.gitAvailable === false && h('div', { className: 'sk-tag danger' }, t('gitMissing')),
         row(t('dirLabel'), status.dir),
-        h('input', { className: 'sk-input', value: repoUrl, onChange: e => setRepoUrl(e.target.value), placeholder: t('repoUrlPlaceholder'), style: { width: '100%' } }),
+        h('div', { className: 'sk-dir', style: { margin: '4px 0' } }, t('providerLabel')),
+        h('div', { className: 'sk-toggles' },
+          REPO_PROVIDERS.map(p => h('label', { key: p.id, className: 'sk-toggle' + (providerChoice === p.id ? ' on' : '') },
+            h('input', { type: 'radio', checked: providerChoice === p.id, onChange: () => applyProvider(p.id) }), t('provider_' + p.id)))),
+        providerChoice === 'other' && h('div', { className: 'sk-hint' }, t('providerOtherRisk')),
+        status.provider && status.provider.unverified ? h('div', { className: 'sk-tag danger' }, t('providerUnverified', { host: status.provider.host || '?' })) : null,
+        h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+          h('input', { className: 'sk-input', value: repoUrl, onChange: e => setRepoUrl(e.target.value), placeholder: t('repoUrlPlaceholder'), style: { flex: 1 } }),
+          status.repoUrl && h(ButtonLite, { onClick: doClearRepoUrl }, t('clearRepoUrl'))),
         h('input', { className: 'sk-input', value: branch, onChange: e => setBranch(e.target.value), placeholder: t('branchLabel'), style: { width: '100%' } }),
         h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
           h('input', { className: 'sk-input', type: 'password', value: token, onChange: e => setToken(e.target.value),
             placeholder: status.hasToken ? `${t('tokenLabel')} · ${t('tokenConfigured')}` : t('tokenLabel'), style: { flex: 1 } }),
+          status.hasToken && h(Tag, { tone: 'accent' }, t('tokenConfigured')),
           status.hasToken && h(ButtonLite, { onClick: doClearToken }, t('clearToken'))),
         h('div', { className: 'sk-dir' }, t('tokenHint')),
         rec && (recApplied || recBoth) ? h(Tag, { tone: recBoth ? 'danger' : 'accent' }, t('reconcileLine', { applied: recApplied, both: recBoth })) : null,
@@ -1061,7 +1208,10 @@ function SettingsSection({ t }) {
       '\u26A0\uFE0F ' + String((renderErr && renderErr.message) || renderErr))
   }
 
-  return h('div', { className: 'sk-page' },
+  return h('div', { className: 'sk-page', ref: rootRef },
+    statusError && h('div', { className: 'sk-tag danger', style: { marginBottom: 8, display: 'inline-flex', alignItems: 'center', gap: 8 } },
+      t('statusError') + ' · ' + statusError,
+      h(ButtonLite, { small: true, onClick: refresh }, t('retry'))),
     h('div', { className: 'sk-body' }, body),
     conflictOpen && status && status.pendingConflict && h(AgentRunDialog, {
       t, mode: 'conflict', pending: status.pendingConflict, onClose: () => setConflictOpen(false), onToast,
@@ -1072,6 +1222,18 @@ function SettingsSection({ t }) {
     browseOpen && h(BrowseRemoteDialog, {
       t, onClose: () => setBrowseOpen(false), onToast,
     }),
+    risk && h(SkDialog, {
+      title: t('riskTitle'),
+      onClose: () => setRisk(null),
+      footer: h('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end' } },
+        h(ButtonLite, { onClick: () => setRisk(null) }, t('close')),
+        h(ButtonLite, { primary: true, onClick: confirmRisk }, t('riskConfirm'))),
+    },
+      h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
+        h('div', { className: 'sk-tag danger' }, t('riskGate')),
+        h('div', null, t('riskBody', { host: risk.host || '?' })),
+        h('div', null, t('riskLeak')),
+        risk.error ? h('div', { className: 'sk-dir' }, risk.error) : null)),
     toastText && h(InToast, { text: toastText }),
   )
 }

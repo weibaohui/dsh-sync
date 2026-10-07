@@ -15,7 +15,7 @@ import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
-import { join } from 'node:path'
+import { join, sep } from 'node:path'
 import { tmpdir } from 'node:os'
 import { execFile } from 'node:child_process'
 import { PassThrough } from 'node:stream'
@@ -28,6 +28,9 @@ const sh = (args, cwd) => new Promise((res, rej) => {
 })
 const gitNoUser = (args, cwd) => sh(['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], cwd)
 const mkdtemp = async () => fsp.mkdtemp(join(tmpdir(), 'dshsync-ai-'))
+// eff.repoUrl 要过 parseRepoUrl（只认 gitcode.com/<owner>/<repo>）：Windows 上裸仓库真实路径
+// 是反斜杠形式，先转成 / 形式再交给它，git 一样能推。
+const asRepoUrl = (p) => p.split(sep).join('/')
 
 // ── Prompt credential regression: the token must have no path into the prompt ──
 
@@ -58,7 +61,7 @@ test('prepareConflictTree checks out the branch tip and merges main into it', as
   const seed = join(tmp, 'seed')
   await fsp.mkdir(seed, { recursive: true })
   await sh(['init', '-b', 'main'], seed)
-  await fsp.writeFile(join(seed, 'skills', 'foo.md').replace('skills/foo.md', 'foo.md'), 'base\n')
+  await fsp.writeFile(join(seed, 'foo.md'), 'base\n')
   await gitNoUser(['add', '-A'], seed)
   await gitNoUser(['commit', '-m', 'seed'], seed)
   await sh(['push', bareRepo, 'main'], seed)
@@ -78,7 +81,7 @@ test('prepareConflictTree checks out the branch tip and merges main into it', as
   await gitNoUser(['commit', '-m', 'remote'], other)
   await sh(['push', 'origin', 'main'], other)
 
-  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', token: '' }
+  const eff = { repoUrl: asRepoUrl(bareRepo), branch: 'main', gitBinary: 'git', token: '' }
   try {
     const prep = await I.prepareConflictTree('git', eff, { repoDir, branch: 'sync/x/1' })
     assert.equal(prep.autoMerged, false)
@@ -120,7 +123,7 @@ test('finalizeConflictBranch: resolved branch pushes, PR merges, shadow advances
   await gitNoUser(['add', '-A'], other)
   await gitNoUser(['commit', '-m', 'remote'], other)
   await sh(['push', 'origin', 'main'], other)
-  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', token: 'tok' }
+  const eff = { repoUrl: asRepoUrl(bareRepo), branch: 'main', gitBinary: 'git', token: 'tok' }
   const state = {}
   // mock GitCode REST: PR #7 mergeable → squash merge ok
   const calls = []
@@ -184,7 +187,7 @@ test('finalizeConflictBranch: unresolved conflict refuses to push', async () => 
   await gitNoUser(['commit', '-m', 'remote'], other)
   await sh(['push', 'origin', 'main'], other)
 
-  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', token: 'tok' }
+  const eff = { repoUrl: asRepoUrl(bareRepo), branch: 'main', gitBinary: 'git', token: 'tok' }
   const state = {}
   let restCalls = 0
   const mk = (obj, status = 200) => ({ ok: status < 400, status, text: async () => JSON.stringify(obj), json: async () => obj })
@@ -229,7 +232,7 @@ test('finalizeConflictBranch: PR still conflicted → no merge, branch kept', as
   await gitNoUser(['commit', '-m', 'local'], repoDir)
   await sh(['push', 'origin', 'sync/x/1'], repoDir)
 
-  const eff = { repoUrl: bareRepo, branch: 'main', gitBinary: 'git', token: 'tok' }
+  const eff = { repoUrl: asRepoUrl(bareRepo), branch: 'main', gitBinary: 'git', token: 'tok' }
   const state = {}
   const mk = (obj, status = 200) => ({ ok: status < 400, status, text: async () => JSON.stringify(obj), json: async () => obj })
   const origFetch = globalThis.fetch

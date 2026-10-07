@@ -2,3 +2,7 @@ node_modules/
 *.log
 .DS_Store
 dist/
+
+# 本地复现/排障脚手架与宿主 harness 产物（不发布）
+.repro/
+undefined/

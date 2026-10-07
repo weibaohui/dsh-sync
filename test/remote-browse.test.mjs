@@ -199,3 +199,42 @@ test('planRemotePull: 目录选择展开为目录下全部文件', async () => {
     assert.deepEqual(plan.plan.every(p => p.action === 'apply'), true, '全部为技能 → 全部允许')
   } finally { await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {}) }
 })
+
+// 0.4.7 回归：浏览 ref（refs/dshsync/browse）相对远端 main 回退时，
+// refspec 不带 + 会被 git 以 non-fast-forward 拒绝（HTTP 400）。
+test('browseRemote: 远端 main 非快进前进后仍能浏览', async () => {
+  const tmp = await mkdtemp()
+  const hub = await mkHub(tmp)
+  const eff = { repoUrl: hub, branch: 'main', gitBinary: 'git', syncSkills: true, syncSessions: false, syncSettings: true, syncPlugins: true, skillsStrategy: 'backup', sessionsStrategy: 'backup', settingsStrategy: 'backup', pluginsStrategy: 'backup', token: '' }
+  const r1 = await mkReplica(tmp, 'r1-mac', eff)
+  const r2 = await mkReplica(tmp, 'r2-linux', eff)
+  try {
+    await write(join(r1.live, '.dsh', 'skills', 'alpha', 'SKILL.md'), 'alpha\n')
+    await driveSync(r1)
+    await driveSync(r2)
+
+    // 第一次浏览：ref 首次写入（[new branch]）必然成功
+    const first = await I.browseRemote('git', r2.eff, { repoDir: r2.repoDir, state: r2.state })
+    assert.equal(first.fetchOk, true)
+    const cached = (await sh(['rev-parse', 'refs/dshsync/browse'], r2.repoDir)).trim()
+
+    // 把远端 main 换成一个与缓存提交无关的新历史（等价于 PR 合并/变基后 main 前移）
+    const divergence = join(tmp, 'divergence')
+    await sh(['init', '-b', 'main', divergence], tmp)
+    await write(join(divergence, 'unrelated.txt'), 'unrelated\n')
+    await gitNoUser(['add', '-A'], divergence)
+    await gitNoUser(['commit', '-m', 'unrelated root'], divergence)
+    await sh(['push', '--force', hub, 'main'], divergence)
+    const newMain = (await sh(['rev-parse', 'main'], divergence)).trim()
+    assert.notEqual(newMain, cached, '远端 main 已换成缓存提交的非后代')
+    await sh(['merge-base', '--is-ancestor', cached, newMain], r2.repoDir).then(
+      () => assert.fail('缓存提交不应仍是新 main 的祖先'),
+      () => {})
+
+    // 修复前：git fetch main:refs/dshsync/browse → ! [rejected] (non-fast-forward)，browseRemote 抛错
+    // 修复后：refspec 带 + → 强制更新，浏览照常可用
+    const again = await I.browseRemote('git', r2.eff, { repoDir: r2.repoDir, state: r2.state })
+    assert.equal(again.fetchOk, true, '非快进前进后浏览仍然成功')
+    assert.equal((await sh(['rev-parse', 'refs/dshsync/browse'], r2.repoDir)).trim(), newMain, '浏览 ref 已强制更新到新的 main')
+  } finally { await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {}) }
+})

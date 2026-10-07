@@ -412,11 +412,18 @@ test('snapshot promote + fetch roundtrip via webdav and local', async () => {
 
 // ── HTTP API：设置白名单 / 协议测试 / 状态投影 ───────────────────────────
 
-function makeHarness(config = {}) {
+function makeHarness(config = {}, { keepSettingsFile = false } = {}) {
   const routes = []
   // 默认关掉调度器：apply() 会 fire startup auto-sync，与测试自身的 POST /sync
   // 抢同一把锁/同一个 syncRun，在 CI 上制造过 20 分钟的测试间卡死（真机实证）。
   // 需要验证调度行为的用例显式传 autoSync 覆盖。
+  //
+  // 自持 settings.json（0.4.3 起的跨重启持久化层）默认清掉：多数用例只想验证
+  // 「传入的 config → 行为」这一段，不该被同一 DSH_HOME 下前一个用例保存的值
+  // 污染。专门验证持久化的用例传 keepSettingsFile: true。
+  if (!keepSettingsFile) {
+    try { fs.rmSync(join(ISO_HOME, 'dsh-sync', 'settings.json'), { force: true }) } catch {}
+  }
   const doc = { sync: { autoSync: false, syncOnStartup: false, ...JSON.parse(JSON.stringify(config)) } }
   const ctx = {
     logger: { info() {}, warn() {}, error() {} },
@@ -451,7 +458,7 @@ function makeHarness(config = {}) {
     try { json = JSON.parse(res.body) } catch {}
     return { status: res.statusCode, json }
   }
-  return { routes, doc, call }
+  return { routes, doc, call, home: ISO_HOME }
 }
 
 test('PUT settings: protocol fields whitelisted, webdavPassword never echoed', async () => {
@@ -500,6 +507,44 @@ test('status reflects protocol state; sync without any protocol is refused', asy
   assert.equal(sync2.json.backup.webdav.ok, false, 'unreachable webdav recorded as failed backup')
 })
 
+// 回归 m00001「点保存配置 → 重启 dsh 后回到默认」：宿主 settings 写回失败（线上日志
+// No configurable plugin entry "dsh-sync"）时，保存必须靠自持 settings.json 跨重启生效。
+test('保存的设置跨重启保留：自持 settings.json 托住宿主写回失败', async () => {
+  const h = makeHarness({})
+  const put = await h.call('PUT', '/dsh-sync/api/settings', {
+    repoUrl: 'https://gitcode.com/me/private.git', intervalMinutes: 45, autoSync: false, skillsStrategy: 'union',
+  })
+  assert.equal(put.status, 200)
+  assert.equal(put.json.persist.fileOk, true, 'settings.json 未写成功: ' + JSON.stringify(put.json.persist))
+  // 模拟重启 dsh：同一 DSH_HOME、全新 apply，且 config 为空（= 宿主写回失败后的真实状态）
+  const reborn = makeHarness({}, { keepSettingsFile: true })
+  const st = await reborn.call('GET', '/dsh-sync/api/status')
+  assert.equal(st.json.intervalMinutes, 45, '重启后回到默认值 ⟹ 本 bug 未修好')
+  assert.equal(st.json.repoUrl, 'https://gitcode.com/me/private.git')
+  assert.equal(st.json.strategies.skills, 'union', '策略也要跨重启保留')
+  const diag = await reborn.call('GET', '/dsh-sync/api/diag')
+  assert.ok(diag.json.fileSettingsKeys.includes('intervalMinutes'), JSON.stringify(diag.json.fileSettingsKeys))
+  assert.equal(diag.json.schemaKind === 'none', false, 'Config 必须已导出（宿主据此判定可配置）')
+})
+
+test('token/webdavPassword 进自持文件但不回显，null 可清除', async () => {
+  // 干净起点：带上一个已存在的 repoUrl 会让 token 触发私仓硬校验（外网调用）
+  const h = makeHarness({})
+  const put = await h.call('PUT', '/dsh-sync/api/settings', { token: 'ghp_secret', webdavPassword: 'dav_secret' })
+  assert.equal(put.status, 200)
+  assert.equal(put.json.settings.token, undefined, 'token never echoed')
+  assert.equal(put.json.settings.webdavPassword, undefined, 'password never echoed')
+  const raw = fs.readFileSync(join(h.home, 'dsh-sync', 'settings.json'), 'utf8')
+  assert.ok(raw.includes('ghp_secret') && raw.includes('dav_secret'), '凭据必须随其它设置一起跨重启保留')
+  const st = await h.call('GET', '/dsh-sync/api/status')
+  assert.equal(st.json.token, undefined)
+  assert.equal(st.json.webdavPassword, undefined)
+  await h.call('PUT', '/dsh-sync/api/settings', { token: null, webdavPassword: null })
+  const raw2 = fs.readFileSync(join(h.home, 'dsh-sync', 'settings.json'), 'utf8')
+  assert.equal(raw2.includes('ghp_secret'), false, 'null 清除后文件里不应再有旧 token')
+  assert.equal(raw2.includes('dav_secret'), false)
+})
+
 test('POST protocol/test: local ok, webdav against fake server, unknown kind refused', async () => {
   const srv = await mkDavServer({ auth: 'u:p' })
   try {
@@ -521,3 +566,87 @@ test('POST protocol/test: local ok, webdav against fake server, unknown kind ref
     assert.equal(unknown.status, 400)
   } finally { await srv.close() }
 })
+
+// 0.4.4 保存语义：'' = 保持不变（旧客户端整表单提交），null = 显式清除；
+// 响应回传 applied/ignored，面板才能区分"保存成功"和"什么都没保存"。
+test('SETTINGS semantics: null clears, empty string keeps, applied/ignored reported', async () => {
+  const h = makeHarness({ repoUrl: 'https://gitcode.com/me/private.git', branch: 'main' })
+  const put1 = await h.call('PUT', '/dsh-sync/api/settings', { repoUrl: '', branch: 'dev', intervalMinutes: 12 })
+  assert.equal(put1.status, 200)
+  assert.equal(h.doc.sync.repoUrl, 'https://gitcode.com/me/private.git', '空串不得清掉已存仓库地址')
+  assert.equal(put1.json.ignored.includes('repoUrl'), true, JSON.stringify(put1.json.ignored))
+  assert.deepEqual([...put1.json.applied].sort(), ['branch', 'intervalMinutes'])
+  // null = 清除：内存 overrides、自持文件、宿主文档三处都要删，否则重启会被 doc 层带回来
+  const put2 = await h.call('PUT', '/dsh-sync/api/settings', { repoUrl: null })
+  assert.equal(put2.status, 200)
+  assert.equal(h.doc.sync.repoUrl, undefined, '宿主文档未清除')
+  assert.equal(put2.json.settings.repoUrl, '', '清除后状态里应为默认空值')
+  assert.ok(put2.json.cleared.includes('repoUrl'))
+  assert.ok(put2.json.applied.includes('repoUrl'))
+  const fileJson = JSON.parse(fs.readFileSync(join(ISO_HOME, 'dsh-sync', 'settings.json'), 'utf8'))
+  assert.equal('repoUrl' in fileJson, false, '自持文件必须同步清除')
+  // 模拟重启「且宿主写回失败」：config 层（cordis.patch.yml 的 config.sync）仍留着旧
+  // repoUrl，墓碑必须把它压回默认值，否则"清除"在重启后复活
+  const reborn = makeHarness({ repoUrl: 'https://gitcode.com/me/private.git' }, { keepSettingsFile: true })
+  const st = await reborn.call('GET', '/dsh-sync/api/status')
+  assert.equal(st.json.repoUrl, '', '重启后应仍是空')
+  // gitAvailable 走 60s 缓存：连续两次 status 都必须是布尔且不抛
+  const st2 = await reborn.call('GET', '/dsh-sync/api/status')
+  assert.equal(typeof st2.json.gitAvailable, 'boolean')
+})
+
+test('SETTINGS semantics: nothing-applied save is reported as such', async () => {
+  const h = makeHarness({})
+  const put = await h.call('PUT', '/dsh-sync/api/settings', { repoUrl: '', branch: '' })
+  assert.equal(put.status, 200)
+  assert.deepEqual(put.json.applied, [], '空表单不应报告写了任何键: ' + JSON.stringify(put.json.applied))
+  assert.ok(put.json.ignored.includes('repoUrl') && put.json.ignored.includes('branch'))
+})
+
+// 0.4.5：托管方支持 —— 已知 provider 自动查私有性，自建/未知主机判不了 ⇒
+// 400 UNVERIFIED_REPO（needConfirm），客户端确认后带 allowUnverifiedRepo 重发。
+test('PUT settings: provider 私有性判定与 UNVERIFIED_REPO 二次确认', async () => {
+  const orig = globalThis.fetch
+  const mk = (obj, status = 200) => ({ ok: status < 400, status, text: async () => JSON.stringify(obj), json: async () => obj })
+  const seen = []
+  globalThis.fetch = async (url, init) => {
+    seen.push(String(url) + ' ' + JSON.stringify((init && init.headers) || {}))
+    if (String(url).includes('api.github.com/repos/me/public-repo')) return mk({ private: false })
+    if (String(url).includes('api.github.com/repos/me/private-repo')) return mk({ private: true, default_branch: 'main' })
+    return mk({ message: 'not found' }, 404)
+  }
+  try {
+    // 公共 GitHub 仓库 → 拒绝，并给出 isPublic 供面板提示
+    const h1 = makeHarness({})
+    const pub = await h1.call('PUT', '/dsh-sync/api/settings', { repoUrl: 'https://github.com/me/public-repo.git', token: 'tok' })
+    assert.equal(pub.status, 400, JSON.stringify(pub.json))
+    assert.equal(pub.json.isPublic, true)
+    // 私有 GitHub 仓库 → 放行，状态里回显 provider
+    const h2 = makeHarness({})
+    const priv = await h2.call('PUT', '/dsh-sync/api/settings', { repoUrl: 'https://github.com/me/private-repo.git', token: 'tok' })
+    assert.equal(priv.status, 200, JSON.stringify(priv.json && priv.json.error))
+    const st2 = await h2.call('GET', '/dsh-sync/api/status')
+    assert.equal(st2.json.provider.kind, 'github')
+    assert.equal(st2.json.provider.unverified, false)
+    // 自建主机：未确认 → 400 UNVERIFIED_REPO；确认后放行
+    const h3 = makeHarness({})
+    const un = await h3.call('PUT', '/dsh-sync/api/settings', { repoUrl: 'https://git.internal.corp/team/repo.git', token: 'tok' })
+    assert.equal(un.status, 400, JSON.stringify(un.json))
+    assert.equal(un.json.code, 'UNVERIFIED_REPO')
+    assert.equal(un.json.needConfirm, true)
+    assert.equal(un.json.host, 'git.internal.corp')
+    assert.ok(/泄露/.test(un.json.error), '文案要说清泄露风险: ' + un.json.error)
+    const ok = await h3.call('PUT', '/dsh-sync/api/settings', { repoUrl: 'https://git.internal.corp/team/repo.git', token: 'tok', allowUnverifiedRepo: true })
+    assert.equal(ok.status, 200, JSON.stringify(ok.json && ok.json.error))
+    assert.equal(ok.json.settings.repoUrl, 'https://git.internal.corp/team/repo.git')
+    const st3 = await h3.call('GET', '/dsh-sync/api/status')
+    assert.equal(st3.json.provider.kind, 'generic')
+    assert.equal(st3.json.provider.unverified, true)
+    assert.equal(st3.json.provider.host, 'git.internal.corp')
+    // GitHub 走 Bearer header，token 不进 URL
+    assert.ok(seen.some(s => s.includes('Bearer')), seen.join(' | '))
+    // seen 条目是 "URL headers"，只看 URL 段（Bearer header 里当然有 tok）
+    assert.ok(!seen.some(s => /github\.com\/repos.*tok/.test(s.split(' ')[0])), 'token 不得出现在 URL 里')
+  } finally { globalThis.fetch = orig }
+})
+

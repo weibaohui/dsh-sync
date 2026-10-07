@@ -1,6 +1,6 @@
 {
   "name": "@weibaohui/dsh-sync",
-  "version": "0.4.2",
+  "version": "0.4.8",
   "description": "dsh 插件 · 多机同步与多协议备份：Git（分支→PR→合并、冲突交 AI）+ WebDAV + 本地文件夹三种协议各一个页签一个开关；技能/会话/设置/插件清单独立开关与策略；纯备份协议与 git backup 布局一致（backup/<实例ID>/）；快照本地优先、多协议通用上云与恢复回退。",
   "license": "MIT",
   "keywords": [
@@ -44,7 +44,7 @@
     "build:client": "node scripts/build-client.mjs",
     "prepublishOnly": "npm run build:client && npm run check && npm test"
   },
-  "devDependencies": {
+  "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.4"
   },
   "repository": {
