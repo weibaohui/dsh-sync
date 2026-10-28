@@ -370,7 +370,14 @@ function substituteParams(template, params) {
   return out
 }
 
-const API = '/dsh-sync/api'
+// API 基址随页面走：子路径反代（如 https://host/app/dsh/）下，绝对路径 /dsh-sync/api
+// 会打到站点根而 404。与宿主官方客户端一致，用 document.baseURI 推导（issue #14）。
+const API = (() => {
+  try {
+    const base = (typeof document !== 'undefined' && document.baseURI) || (typeof location !== 'undefined' ? location.href : '/')
+    return new URL('dsh-sync/api', new URL('.', base)).pathname.replace(/\/+$/, '')
+  } catch { return '/dsh-sync/api' }
+})()
 
 function formatTime(iso) {
   if (!iso) return '-'
@@ -1043,6 +1050,19 @@ function SettingsSection({ t }) {
     }
     const backupRow = (kind) => h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 12 } },
       h('span', { className: 'sk-dir' }, t('lastBackupLabel')), h('span', { className: 'sk-hint', style: { textAlign: 'right', wordBreak: 'break-all' } }, backupLine(kind)))
+
+    // status 未就绪（首帧/请求失败）时先渲染加载态并早退：下方 generalEl/gitEl/...
+    // 会直接读 status.instanceId 等字段，null 时会抛 TypeError 使整页变成错误卡。
+    // 早退位于全部 hooks（useState/useRef/useEffect）之后，不违反 hooks 规则（issue #14）。
+    if (status === null) {
+      return h('div', { className: 'sk-page', ref: rootRef },
+        statusError && h('div', { className: 'sk-tag danger', style: { marginBottom: 8, display: 'inline-flex', alignItems: 'center', gap: 8 } },
+          t('statusError') + ' · ' + statusError,
+          h(ButtonLite, { small: true, onClick: refresh }, t('retry'))),
+        h('div', { className: 'sk-body' },
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, padding: 24, color: 'var(--dsw-alias-label-secondary)' } },
+            h('div', { className: 'sk-spin' }), statusError ? t('statusError') : '…')))
+    }
 
     // ── 通用 tab：实例状态 / 内容开关 / 快照 / 调度 ──
     const generalEl = [

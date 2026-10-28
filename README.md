@@ -147,7 +147,7 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 - **非 GitCode 的功能差异**：PR 创建/合并、「AI 冲突处理」(`conflict/run`)、「清理遗留分支」(`prune-branches`) 目前仍是 GitCode 专属；其他托管方走「只推分支」的降级路径（`prSkipped`），这些入口会返回明确错误而不是静默失败。
 - **登录用户名按托管方**：GitHub 需要 `x-access-token`，其余用 `oauth2`（经 `DSH_SYNC_USER` 传给 askpass 助手；token 依旧只走环境变量、不进 argv）。
 
-## 更新日志（0.4.3 → 0.4.8）
+## 更新日志（0.4.3 → 0.4.9）
 
 0.4.3–0.4.5 围绕同一条问题链：**「点保存 → 提示成功 → 重启 dsh 后设置回到默认」**。0.4.3 修根因，0.4.4 补面板状态层与保存语义，0.4.5 扩展托管方并明确泄露风险闸门；0.4.6 收尾同一批 Windows 环境下暴露的问题（覆盖镜像不生效 + 测试夹具的环境假设）；0.4.7 修另一条独立的线：「浏览远端」报 400（浏览 ref 的非快进更新被 git 拒绝）；0.4.8 修桌面版 AI 对齐不可用（apiproxy 基地址写死 3080）与「远端 main 被改写后同步基线失效、会话日志永久挂账」。
 
@@ -263,6 +263,24 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 - 「AI 智能对齐」不再报 `fetch failed`（基地址取到宿主随机端口，本机实测 `http://127.0.0.1:43120`）；
 - 升级后本机原有的挂账自动解开：`state.pendingBoth` 归空，影子仓库 `sessions/` 出现新提交 `2e930da`（2026-10-07 00:32:48），并随 PR `!25` 合并进远端 main（`d6b1a13`），`lastSyncedCommit` 随之更新；此前该会话卡了约 3 小时 45 分，期间每轮只推得动 `plugins/`；
 - 用户在本机确认：设置页「AI 智能对齐」正常，点击同步后 `session` 也能同步上去。
+
+### 0.4.9 —— 设置页首帧整块崩溃 + 子路径反代部署全 404（issue #14）
+
+两个问题均由用户 SDWSXXR 报告并附完整分析与 patch（issue #14），本版在其 patch 基础上落地。
+
+**现象 1**：打开「设置 → dsh-sync」整块不渲染，只有一张错误卡 `Cannot read properties of null (reading 'instanceId')`，必现。
+
+**根因 1**：`SettingsSection` 里 `generalEl/gitEl/webdavEl/localEl` 四个数组无条件构造，直接读 `status.instanceId` 等字段；首帧 `status` 必为 `null`，构造即抛 `TypeError`，被外层 `catch` 捕获渲染成错误卡。原有的 `body = status === null ? 加载态 : …` 守卫位于构造**之后**，永远执行不到。
+
+**改动 1**：在全部 hooks 之后、`generalEl` 构造之前插入早退分支——`status === null` 时渲染加载态（请求失败时附错误文案 + 重试按钮）。
+
+**现象 2**：DSH Web 经反代挂在子路径（如 `https://host/app/dsh/`）时，「保存」报 404、状态显示读取失败；请求丢掉反代前缀打到站点根。
+
+**根因 2**：客户端把 API 基址写死为绝对路径 `const API = '/dsh-sync/api'`，绝对路径不受 `<base href>` 影响，子路径部署下必然 404。
+
+**改动 2**：API 基址改由 `document.baseURI` 推导（与宿主官方客户端同口径），根路径部署推导结果不变；极端环境退回原绝对路径。
+
+**验证**：新增 `test/client-settings-null-status.test.mjs` 回归测试 2 项——首帧渲染加载态且 `__skErrors` 无记录（无修复时该测试如预期失败）、status 到达后正常渲染 instanceId 与页签；全量 84 项通过。`client/bundle.js` 相对 0.4.8 的差异经构建管线核对仅含上述两处改动。
 
 ## 联系我 :飞书群
 

@@ -19,7 +19,7 @@ window.__ModuleLoader__.load({
      * (`zh`/`en`). The client never sees the access token in cleartext — only
      * `hasToken`.
      */
-    
+
     // React is a loader platform module. Under plain Node (contract tests) a
     // minimal createElement/hook shim keeps the source loadable for assertions.
     let __React = null
@@ -34,18 +34,18 @@ window.__ModuleLoader__.load({
       }
     }
     const { createElement: h, useState, useEffect, useMemo, useRef } = __React
-    
+
     // Platform module — always present in the loader's seeded require table.
     // Under plain Node (tests) it is absent; a tagged-element shim keeps the
     // tree structurally testable while every real surface ships primitives.
     let P = null
     try { P = require('@deepseek-ai/dsh-client-ui-primitives') } catch {}
-    
+
     // NOTE: no class components in this module. A `class X extends
     // React.Component` error boundary defined here silently killed rendering in
     // the plugin loader — render-time crashes are handled by the try/catch inside
     // SettingsSection and recorded into globalThis.__skErrors instead.
-    
+
     /** Idempotent stylesheet injection. */
     function ensureStyles() {
       if (typeof document === 'undefined' || document.getElementById('dshsync-styles')) return
@@ -55,25 +55,25 @@ window.__ModuleLoader__.load({
       holder.innerHTML = STYLE
       document.head.appendChild(holder)
     }
-    
+
     const prim = (name) => P && P[name]
       ? P[name]
       : function Shim(props) {
           const { children, ...rest } = props
           return h('button', { ...rest, 'data-p-shim': name }, children)
         }
-    
+
     // Sessions service (client runtime): opens the conflict run's conversation
     // in the real UI. Resolved through dynamic ctx.inject; absence degrades the
     // 打开对话 button to hidden. dsh 0.1.7 removed sessions.open() — navigation
     // moved to uiWorkspace.openSession(); both faces are normalized to { open(id) }.
     let sessionsApi = null
     const sessionsSvc = () => sessionsApi
-    
+
     // ── Locale ───────────────────────────────────────────────────────────────
-    
+
     const NS = 'dshSync'
-    
+
     const ZH = {
       title: '同步',
       syncNow: '立即同步',
@@ -221,7 +221,7 @@ window.__ModuleLoader__.load({
       browseTruncated: '（内容过长，已截断）',
       browseLoading: '加载中…',
     }
-    
+
     const EN = {
       title: 'Sync',
       syncNow: 'Sync now',
@@ -369,9 +369,9 @@ window.__ModuleLoader__.load({
       browseTruncated: '(content too long, truncated)',
       browseLoading: 'Loading…',
     }
-    
+
     // ── Pure helpers ────────────────────────────────────────────────────────
-    
+
     function substituteParams(template, params) {
       let out = template
       for (const [key, value] of Object.entries(params)) {
@@ -379,9 +379,16 @@ window.__ModuleLoader__.load({
       }
       return out
     }
-    
-    const API = '/dsh-sync/api'
-    
+
+    // API 基址随页面走：子路径反代（如 https://host/app/dsh/）下，绝对路径 /dsh-sync/api
+    // 会打到站点根而 404。与宿主官方客户端一致，用 document.baseURI 推导（issue #14）。
+    const API = (() => {
+      try {
+        const base = (typeof document !== 'undefined' && document.baseURI) || (typeof location !== 'undefined' ? location.href : '/')
+        return new URL('dsh-sync/api', new URL('.', base)).pathname.replace(/\/+$/, '')
+      } catch { return '/dsh-sync/api' }
+    })()
+
     function formatTime(iso) {
       if (!iso) return '-'
       try {
@@ -395,9 +402,9 @@ window.__ModuleLoader__.load({
         return 'now'
       } catch { return '-' }
     }
-    
+
     // ── Token-based stylesheet (light/dark adaptive by construction) ────────
-    
+
     const STYLE = `<style>
     .sk-page{position:relative;display:flex;flex-direction:column;gap:14px;color:var(--dsw-alias-label-primary);font-family:var(--dsw-font-family);font-size:var(--dsw-font-sm-14,14px)}
     .sk-body{display:flex;flex-direction:column;gap:14px}
@@ -437,9 +444,9 @@ window.__ModuleLoader__.load({
     .sk-input::placeholder{color:var(--dsw-alias-label-tertiary)}
     .sk-toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:40;background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-primary);border:1px solid var(--dsw-alias-border-l2);border-radius:999px;padding:8px 18px;font-size:13px;box-shadow:var(--dsw-shadow-lv2)}
     </style>`
-    
+
     // ── Fetch layer ─────────────────────────────────────────────────────────
-    
+
     async function getJson(url) {
       const r = await fetch(url)
       if (!r.ok) {
@@ -455,12 +462,12 @@ window.__ModuleLoader__.load({
       }
       return r.json()
     }
-    
+
     // ── Small building blocks ────────────────────────────────────────────────
-    
+
     const Tag = ({ tone, children }) =>
       h('span', { className: 'sk-tag' + (tone ? ' ' + tone : '') }, children)
-    
+
     function ButtonLite({ primary, danger, small, children, ...rest }) {
       const cls = 'sk-btn' + (primary ? ' sk-btn-primary' : '') + (danger ? ' sk-btn-primary' : '') + (small ? ' sk-btn-sm' : '')
       if (prim('Button')) {
@@ -468,7 +475,7 @@ window.__ModuleLoader__.load({
       }
       return h('button', { className: cls, ...rest }, children)
     }
-    
+
     /** In-page dialog: fixed backdrop inside the settings page stacking context. */
     function SkDialog({ title, onClose, footer, children, wide }) {
       return h('div', { className: 'sk-dlg-backdrop', onClick: onClose },
@@ -478,11 +485,11 @@ window.__ModuleLoader__.load({
           children,
           footer && h('div', { className: 'sk-dlg-foot' }, footer)))
     }
-    
+
     function InToast({ text }) {
       return h('div', { className: 'sk-toast' }, text)
     }
-    
+
     // ── Agent-run dialog: action-button pattern for three modes ──
     //    conflict:    user opens it, then clicks run (needs pending PR info)
     //    align:       parent already POSTed (which ran a deterministic sync first),
@@ -490,7 +497,7 @@ window.__ModuleLoader__.load({
     //    remoteAlign: parent (BrowseRemoteDialog) already POSTed, dialog opens
     //                 with the job streaming and the cross-machine file list
     //    All poll the same shape of job endpoint and can open the agent session.
-    
+
     function AgentRunDialog({ t, mode, pending, initial, onClose, onToast }) {
       const align = mode === 'align'
       const remoteAlign = mode === 'remote-align'
@@ -553,13 +560,13 @@ window.__ModuleLoader__.load({
             !align && !remoteAlign && h(ButtonLite, { primary: true, disabled: busy || (job !== null && job.status === 'running'), onClick: doRun },
               job !== null && job.status === 'running' ? t('running') : t('resolveBtn')))))
     }
-    
+
     // ── Remote backup browser dialog: browse the remote tree, identify which
     //    machine each backup belongs to, select files to pull. Two-phase pull:
     //    preview (dry-run plan with safety decisions) → apply (writes to live
     //    with a pre-pull safety snapshot). Plugin manifests and settings.yaml
     //    from another machine are blocked server-side (crash guard).
-    
+
     function BrowseRemoteDialog({ t, onClose, onToast }) {
       const [browse, setBrowse] = useState(null)
       const [tree, setTree] = useState(null)
@@ -570,7 +577,7 @@ window.__ModuleLoader__.load({
       const [alignOpen, setAlignOpen] = useState(false)
       const [alignInitial, setAlignInitial] = useState(null)
       const [filePreview, setFilePreview] = useState(null)
-    
+
       const refreshBrowse = () => {
         setBusy(true); setPreview(null); setSelected({}); setFilePreview(null)
         getJson(API + '/remote/browse').then(d => {
@@ -580,7 +587,7 @@ window.__ModuleLoader__.load({
           .finally(() => setBusy(false))
       }
       useEffect(() => { refreshBrowse() }, [])
-    
+
       const navigateTo = (path) => {
         if (!path) { refreshBrowse(); return }
         setBusy(true); setPreview(null); setSelected({}); setFilePreview(null)
@@ -591,21 +598,21 @@ window.__ModuleLoader__.load({
         }).catch(e => onToast(e.message || t('operationFailed'), 3000))
           .finally(() => setBusy(false))
       }
-    
+
       const previewFile = (path) => {
         setFilePreview({ path, loading: true })
         getJson(API + '/remote/preview?path=' + encodeURIComponent(path)).then(d => {
           setFilePreview(d)
         }).catch(e => { setFilePreview(null); onToast(e.message || t('operationFailed'), 3000) })
       }
-    
+
       const fullPath = (name) => tree && tree.path ? tree.path + '/' + name : name
       const toggleSelect = (name) => {
         const fp = fullPath(name)
         setSelected(prev => { const n = { ...prev }; if (n[fp]) delete n[fp]; else n[fp] = true; return n })
       }
       const selectedCount = Object.keys(selected).length
-    
+
       const doPreview = async () => {
         const paths = Object.keys(selected)
         if (!paths.length) { onToast(t('browseSelectSome'), 2500); return }
@@ -618,7 +625,7 @@ window.__ModuleLoader__.load({
         } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
         finally { setBusy(false) }
       }
-    
+
       const doApply = async () => {
         const paths = Object.keys(selected)
         setApplying(true)
@@ -632,7 +639,7 @@ window.__ModuleLoader__.load({
         } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
         finally { setApplying(false) }
       }
-    
+
       const doRemoteAlign = async () => {
         const paths = Object.keys(selected)
         if (!paths.length) { onToast(t('browseSelectSome'), 2500); return }
@@ -646,14 +653,14 @@ window.__ModuleLoader__.load({
         } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
         finally { setBusy(false) }
       }
-    
+
       const segments = tree && tree.path ? tree.path.split('/').filter(Boolean) : []
       const instChips = browse && browse.instances ? browse.instances : []
       const entries = tree ? (tree.entries || []) : []
       const applyCount = preview ? preview.applyCount : 0
       const blockCount = preview ? preview.blockCount : 0
       const warnCount = preview ? preview.warnCount : 0
-    
+
       // Build sub-sections as variables to avoid deeply-nested ternary parens.
       const isInstActive = (instId) => tree && tree.path && tree.path.startsWith('backup/' + instId)
       // 本机 tag 用绿色（success），选中态用蓝色加粗描边——两色截然不同
@@ -677,7 +684,7 @@ window.__ModuleLoader__.load({
               onClick: () => navigateTo(''),
             }, t('browseRoot')))
         : null
-    
+
       // commit hash + 刷新按钮：让用户知道数据来源版本
       const commitBar = browse && browse.lastCommit
         ? h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 } },
@@ -686,14 +693,14 @@ window.__ModuleLoader__.load({
             h('span', { className: 'sk-spacer' }),
             h(ButtonLite, { small: true, disabled: busy, onClick: refreshBrowse }, t('browseRefresh')))
         : null
-    
+
       const crumb = h('div', { style: { display: 'flex', alignItems: 'center', gap: 2, flexWrap: 'wrap' } },
         h('button', { className: 'sk-dir', style: { cursor: 'pointer', background: 'transparent', border: 'none', padding: 0 }, onClick: () => navigateTo('') }, t('browseRoot')),
         segments.map((seg, i) => h('span', { key: i, style: { display: 'flex', alignItems: 'center', gap: 2 } },
           h('span', { className: 'sk-dir' }, '/'),
           h('button', { className: 'sk-dir', style: { cursor: 'pointer', background: 'transparent', border: 'none', padding: 0 }, onClick: () => navigateTo(segments.slice(0, i + 1).join('/')) }, seg))),
         tree && tree.path && h('button', { className: 'sk-dir', style: { cursor: 'pointer', background: 'transparent', border: 'none', padding: 0, marginLeft: 4 }, onClick: () => navigateTo(segments.slice(0, -1).join('/')) }, '↑ ' + t('browseUp')))
-    
+
       const entryList = entries.length === 0
         ? h('div', { className: 'sk-hint', style: { padding: 12 } }, t('browseEmpty'))
         : h('div', { style: { maxHeight: 240, overflow: 'auto', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 8 } },
@@ -706,7 +713,7 @@ window.__ModuleLoader__.load({
                   ? h('button', { style: { cursor: 'pointer', background: 'transparent', border: 'none', color: 'var(--dsw-alias-state-business-primary)', padding: 0, fontSize: 13, fontFamily: 'var(--dsw-font-family)' }, onClick: () => navigateTo(fp) }, '📁 ' + e.name)
                   : h('button', { style: { cursor: 'pointer', background: 'transparent', border: 'none', color: isPreviewing ? 'var(--dsw-alias-state-business-primary)' : 'var(--dsw-alias-label-primary)', padding: 0, fontSize: 13, fontFamily: 'var(--dsw-font-family)' }, onClick: () => previewFile(fp) }, '📄 ' + e.name))
             }))
-    
+
       // 文件预览面板：点击文件名后显示内容
       const filePreviewEl = filePreview && h('div', { className: 'sk-card', style: { maxHeight: 200, overflow: 'auto', padding: '8px 12px' } },
         h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 } },
@@ -719,7 +726,7 @@ window.__ModuleLoader__.load({
             ? h('div', { className: 'sk-hint' }, t('browseBinary'))
             : h('pre', { style: { margin: 0, whiteSpace: 'pre-wrap', fontSize: 11.5, lineHeight: 1.4, fontFamily: 'var(--dsw-font-family)' } },
                 filePreview.content || '', filePreview.truncated && h('span', { className: 'sk-dir' }, '\n' + t('browseTruncated'))))
-    
+
       const browseBody = browse === null
         ? h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, padding: 20 } }, h('div', { className: 'sk-spin' }), '…')
         : browse.repoReady === false
@@ -730,7 +737,7 @@ window.__ModuleLoader__.load({
                 instChipsEl, commitBar, crumb,
                 h('div', { className: 'sk-dir' }, t('browseSelectHint')),
                 entryList, filePreviewEl)
-    
+
       const previewEl = preview && h('div', { className: 'sk-card' },
         h('div', { style: { display: 'flex', gap: 10, marginBottom: 6 } },
           h(Tag, { tone: 'accent' }, t('browseAppliedN', { n: applyCount })),
@@ -743,7 +750,7 @@ window.__ModuleLoader__.load({
               p.livePath && h('span', { className: 'sk-dir', style: { display: 'block', fontSize: 11 } }, '→ ' + p.livePath)),
             p.warn && h('span', { className: 'sk-dir', style: { maxWidth: '55%', flexShrink: 0, color: 'var(--dsw-alias-state-warning-primary, #e6a700)' } }, p.warn),
             p.action === 'block' && h('span', { className: 'sk-dir', style: { maxWidth: '55%', flexShrink: 0 } }, p.reason)))))
-    
+
       const applyLabel = applying ? '…' : t('browseApply') + ' (' + applyCount + ')'
       const footer = h('div', { className: 'sk-dlg-foot' },
         h('span', { className: 'sk-dir' }, t('browseNSelected', { n: selectedCount })),
@@ -754,7 +761,7 @@ window.__ModuleLoader__.load({
         preview
           ? h(ButtonLite, { primary: true, disabled: applying || applyCount === 0, onClick: doApply }, applyLabel)
           : h(ButtonLite, { primary: true, disabled: busy || selectedCount === 0, onClick: doPreview }, t('browsePreview')))
-    
+
       return h('div', null,
         h(SkDialog, { title: t('browseTitle'), onClose, wide: true },
           h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10, minWidth: 400, maxWidth: 720 } },
@@ -765,9 +772,9 @@ window.__ModuleLoader__.load({
           onClose: () => { setAlignOpen(false); refreshBrowse() }, onToast,
         }))
     }
-    
+
     // ── Settings section: the single entrance (host settings page section) ──
-    
+
     // Provider 按钮组：默认 GitCode（点选只改地址前缀，保留已填的 owner/repo 路径）。
     const REPO_PROVIDERS = [
       { id: 'gitcode', host: 'https://gitcode.com/' },
@@ -776,7 +783,7 @@ window.__ModuleLoader__.load({
       { id: 'gitee', host: 'https://gitee.com/' },
       { id: 'other', host: '' },
     ]
-    
+
     function SettingsSection({ t }) {
       const [status, setStatus] = useState(null)
       const [busy, setBusy] = useState(false)
@@ -818,7 +825,7 @@ window.__ModuleLoader__.load({
       // 当前选中的托管方（按钮组回显）；'other' = 自建/未知主机，保存时要风险确认
       const [providerChoice, setProviderChoice] = useState('gitcode')
       const [risk, setRisk] = useState(null)
-    
+
       const onToast = (text, ms = 3000) => { setToastText(text); setTimeout(() => setToastText(null), ms) }
       // 服务端值回填表单：每次成功轮询都回填，但只在用户没动过表单时（dirtyRef 由
       // 根节点上的原生 input/change 捕获监听置位）。旧实现只在首次成功时回填，
@@ -868,7 +875,7 @@ window.__ModuleLoader__.load({
           el.removeEventListener('change', mark, true)
         }
       }, [])
-    
+
       const doSync = async () => {
         setBusy(true)
         try {
@@ -1019,7 +1026,7 @@ window.__ModuleLoader__.load({
         try { await putSettings({ token: null }); onToast(t('saved'), 2200); refresh() }
         catch (e) { onToast(e.message || t('operationFailed'), 4000) }
       }
-    
+
       let body
       try {
         const row = (label, value) => h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 12, padding: '3px 0' } },
@@ -1053,7 +1060,20 @@ window.__ModuleLoader__.load({
         }
         const backupRow = (kind) => h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 12 } },
           h('span', { className: 'sk-dir' }, t('lastBackupLabel')), h('span', { className: 'sk-hint', style: { textAlign: 'right', wordBreak: 'break-all' } }, backupLine(kind)))
-    
+
+        // status 未就绪（首帧/请求失败）时先渲染加载态并早退：下方 generalEl/gitEl/...
+        // 会直接读 status.instanceId 等字段，null 时会抛 TypeError 使整页变成错误卡。
+        // 早退位于全部 hooks（useState/useRef/useEffect）之后，不违反 hooks 规则（issue #14）。
+        if (status === null) {
+          return h('div', { className: 'sk-page', ref: rootRef },
+            statusError && h('div', { className: 'sk-tag danger', style: { marginBottom: 8, display: 'inline-flex', alignItems: 'center', gap: 8 } },
+              t('statusError') + ' · ' + statusError,
+              h(ButtonLite, { small: true, onClick: refresh }, t('retry'))),
+            h('div', { className: 'sk-body' },
+              h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, padding: 24, color: 'var(--dsw-alias-label-secondary)' } },
+                h('div', { className: 'sk-spin' }), statusError ? t('statusError') : '…')))
+        }
+
         // ── 通用 tab：实例状态 / 内容开关 / 快照 / 调度 ──
         const generalEl = [
           h('div', { className: 'sk-card' },
@@ -1105,7 +1125,7 @@ window.__ModuleLoader__.load({
                       h('span', { className: 'sk-spacer' }),
                       h(ButtonLite, { small: true, disabled: snapBusy, onClick: () => doRestore(s.name) }, t('snapshotRestore'))))))),
         ]
-    
+
         // ── Git tab：开关 + 仓库/令牌 + 冲突处理 + AI 按钮 ──
         const rec = status.lastResult && status.lastResult.reconcile
         const recApplied = rec && Array.isArray(rec.applied) ? rec.applied.length : 0
@@ -1154,7 +1174,7 @@ window.__ModuleLoader__.load({
                 h('input', { type: 'radio', checked: conflictMode === 'manual', onChange: () => setConflictMode('manual') }), t('conflictModeManual'))),
             h('div', { className: 'sk-dir', style: { marginTop: 4 } }, t('conflictModeHint'))),
         ]
-    
+
         // ── WebDAV tab：开关 + 地址/账号 + 测试 + 上次备份 ──
         const webdavEl = [
           protocolToggle(wdvOn, setWdvOn, t('webdavEnabledLabel')),
@@ -1176,7 +1196,7 @@ window.__ModuleLoader__.load({
             testRow('webdav'),
             backupRow('webdav')),
         ]
-    
+
         // ── 本地文件夹 tab：开关 + 目录 + 测试 + 上次备份 ──
         const localEl = [
           protocolToggle(locOn, setLocOn, t('localEnabledLabel')),
@@ -1188,7 +1208,7 @@ window.__ModuleLoader__.load({
             testRow('local'),
             backupRow('local')),
         ]
-    
+
         // 底部工具栏（所有页签可见）：保存 + 立即同步；未启用任何协议时给提示
         const pr = status.protocols || {}
         const anyActive = !!((pr.git && pr.git.enabled !== false && status.repoUrl && status.hasToken)
@@ -1198,7 +1218,7 @@ window.__ModuleLoader__.load({
           h(ButtonLite, { onClick: doSave }, t('save')),
           h(ButtonLite, { primary: true, disabled: busy || status.syncing || !anyActive, title: !anyActive ? t('noProtocolEnabled') : undefined, onClick: doSync }, busy ? t('syncing') : t('syncNow')),
           !anyActive && h('span', { className: 'sk-tag accent' }, t('noProtocolEnabled')))
-    
+
         const TABS = [['general', 'tabsGeneral'], ['git', 'tabsGit'], ['webdav', 'tabsWebdav'], ['local', 'tabsLocal']]
         const wrap = (kids) => h('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } }, kids)
         body = status === null
@@ -1217,7 +1237,7 @@ window.__ModuleLoader__.load({
         body = h('div', { className: 'sk-card', style: { color: 'var(--dsw-alias-state-error-primary)' } },
           '\u26A0\uFE0F ' + String((renderErr && renderErr.message) || renderErr))
       }
-    
+
       return h('div', { className: 'sk-page', ref: rootRef },
         statusError && h('div', { className: 'sk-tag danger', style: { marginBottom: 8, display: 'inline-flex', alignItems: 'center', gap: 8 } },
           t('statusError') + ' · ' + statusError,
@@ -1247,16 +1267,16 @@ window.__ModuleLoader__.load({
         toastText && h(InToast, { text: toastText }),
       )
     }
-    
+
     function SettingsSlotComponent(props) {
       useEffect(ensureStyles, [])
       return h(SettingsSection, { t: props.__t })
     }
-    
+
     // ── Plugin plane contract ────────────────────────────────────────────────
-    
+
     const CLIENT_NAME = '@weibaohui/dsh-sync'
-    
+
     module.exports = {
       name: CLIENT_NAME,
       inject: ['slots', 'locale'],
