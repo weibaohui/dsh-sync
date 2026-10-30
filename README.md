@@ -147,7 +147,7 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 - **非 GitCode 的功能差异**：PR 创建/合并、「AI 冲突处理」(`conflict/run`)、「清理遗留分支」(`prune-branches`) 目前仍是 GitCode 专属；其他托管方走「只推分支」的降级路径（`prSkipped`），这些入口会返回明确错误而不是静默失败。
 - **登录用户名按托管方**：GitHub 需要 `x-access-token`，其余用 `oauth2`（经 `DSH_SYNC_USER` 传给 askpass 助手；token 依旧只走环境变量、不进 argv）。
 
-## 更新日志（0.4.3 → 0.4.9）
+## 更新日志（0.4.3 → 0.4.10）
 
 0.4.3–0.4.5 围绕同一条问题链：**「点保存 → 提示成功 → 重启 dsh 后设置回到默认」**。0.4.3 修根因，0.4.4 补面板状态层与保存语义，0.4.5 扩展托管方并明确泄露风险闸门；0.4.6 收尾同一批 Windows 环境下暴露的问题（覆盖镜像不生效 + 测试夹具的环境假设）；0.4.7 修另一条独立的线：「浏览远端」报 400（浏览 ref 的非快进更新被 git 拒绝）；0.4.8 修桌面版 AI 对齐不可用（apiproxy 基地址写死 3080）与「远端 main 被改写后同步基线失效、会话日志永久挂账」。
 
@@ -282,6 +282,18 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 
 **验证**：新增 `test/client-settings-null-status.test.mjs` 回归测试 2 项——首帧渲染加载态且 `__skErrors` 无记录（无修复时该测试如预期失败）、status 到达后正常渲染 instanceId 与页签；全量 84 项通过。`client/bundle.js` 相对 0.4.8 的差异经构建管线核对仅含上述两处改动。
 
+### 0.4.10 —— webdavDir 不存在时首次备份 409（issue #15）
+
+外部用户报告（issue #15，附坚果云直连实测与根因分析）：webdavDir 填一个**尚不存在**的远端子目录时，「测试连接」返回成功但「立即同步」失败，`state.json` 记录 `MKCOL backup: HTTP 409`；手动在坚果云网页版建出同名文件夹后同步即恢复。
+
+**根因**：`basePath`（即 webdavDir）只被拼进 URL 根，`mkdirs()` 仅对相对路径逐级 MKCOL，**basePath 自身从未被创建**。坚果云实测：父集合不存在时 MKCOL 返回 **409 Conflict**（RFC 4918；405 才是目标已存在），插件只放行 405/301 → `mkdirs('backup/<实例ID>')` 的首段 `MKCOL <root>/backup` 直接 409。probe 将 404 判为连接正常（远端根目录不存在读成"服务在线"），故「测试连接」通过而备份才失败。
+
+**改动**：
+- `src/webdav.js` 新增 `ensureBase()`：在 `mkdirs()` 入口先创建 basePath——相对 **DAV 根**逐段 MKCOL、405/301 容忍、成功后缓存（后续 mkdirs 不重放）；basePath 为空时循环零次、零请求。`request()` 增加 `abs` 覆盖参数（rel 相对 `<root>` 解析够不到 basePath 之下的祖先段；issue 建议的 `request('MKCOL', cum)` 写法会 MKCOL 到 `<root>/<basePath>` 而非 basePath 自身）。
+- probe() 404 附带 `baseMissing` 标记；客户端测试连接结果行渲染「远端子目录尚不存在，将在首次备份时自动创建」（中英双语）。
+
+**验证**：伪 WebDAV 服务器新增 `strictParents` 模式复刻坚果云 409 行为，回归覆盖 basePath 先建顺序（MKCOL 日志断言 `/dsh-sync` 先于 `/dsh-sync/backup`）、ensureBase 缓存、首次同步即成功、空 basePath 零行为变化；全量 86 项通过。
+
 ## 联系我 :飞书群
 
 ![link](https://foruda.gitee.com/images/1774880015525784725/4fd67005_77493.png "link")
@@ -290,10 +302,12 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 
 本插件与 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（`@deepseek-ai/dsh`）的版本对应关系：
 
-> 0.4.3 / 0.4.4 / 0.4.5 / 0.4.6 / 0.4.7 / 0.4.8 六个版本的详细改动说明见上文「更新日志（0.4.3 → 0.4.8）」。
+> 各版本的详细改动说明见上文「更新日志」。
 
 | 插件版本 | 适配 dsh 版本 | 备注 |
 |---------|--------------|------|
+| 0.4.10 | 0.2.1-rc.2 | 修复 issue #15：webdavDir（basePath）不存在时首次备份 409——坚果云在父集合缺失时 MKCOL 返回 409 Conflict（RFC 4918），basePath 自身从未被创建；新增 `ensureBase()` 在 `mkdirs()` 入口先相对 DAV 根逐段创建 basePath（405/301 容忍、成功后缓存，basePath 为空零请求），`request()` 增加 `abs` 覆盖；probe 404 附带 `baseMissing` 标记，客户端测试连接行提示「远端子目录尚不存在，将在首次备份时自动创建」；伪服务器 `strictParents` 模式复刻坚果云行为，离线测试 86 项 |
+| 0.4.9 | 0.1.7-rc.2 | 修复 issue #14（两题均由用户 SDWSXXR 报告并附 patch）：(1) 设置页首帧整块崩溃——`status === null` 早退渲染加载态；(2) 子路径反代部署全 404——客户端 API 基址改由 `document.baseURI` 推导；离线测试 84 项 |
 | 0.4.8 | 0.1.7-rc.2 | 修复两条与 Windows/桌面版相关的独立问题：(1) **桌面版 AI 智能对齐/解决冲突只报 `fetch failed`**——apiproxy 基地址写死 `http://127.0.0.1:3080`，而桌面宿主 Web 服务用随机端口（实测 43120），改为 `apply()` 用 `ctx.webServer.port` 覆盖（`DSH_WEB_URL`/3080 保留兜底），网络错误信息带上尝试过的基地址；(2) **远端 main 被改写后同步基线失效 → 会话日志永久挂账**——`lastSyncedCommit` 不再是远端 tip 的祖先时 `git diff 基线 FETCH_HEAD` 会把本机正在写的文件误判 bothModified（推送时按 preserve 回退成远端版本，且只能靠 AI 对齐销账），新增 `resolveSyncBase()` 退化到 `git merge-base`、`revalidatePendingBoth()` 自动销账失效挂账、`runPush` 未合并路径 `restoreBaseline()` 恢复 HEAD；离线测试 82 项（新增 3 例基线守护/apiproxy 回归） |
 | 0.4.7 | 0.1.7-rc.2 | 修复：Git 页签「浏览远端」报 400。浏览 ref（`refs/dshsync/browse`）相对远端 main 常处于回退状态，refspec 无 `+` 时 git 以 `non-fast-forward` 拒绝（远端对象已取回、`FETCH_HEAD` 已写，仅本地 ref 不动）→ 改为强制更新；客户端 `getJson` 失败时读响应体 `error`，不再只显示 `HTTP 400`；离线测试 79 项（新增 1 例浏览回归） |
 | 0.4.6 | 0.1.7-rc.2 | 修复 Windows：远端为准（只读镜像）策略的覆盖循环因 git 路径引号转义 + 分隔符不一致而静默空转（`gitDiffNameStatus` 改 `-z` 解析 + `normGitPath` 归一化比较）；镜像写入改为从 HEAD 取仓库原始字节，不受 `core.autocrlf` 影响；同步修掉 4 例只在 Windows 必失败的上游测试环境假设（conflict-ai 夹具路径、askpass 的 `/bin/sh`）；离线测试 78 项 |
