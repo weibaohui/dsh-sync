@@ -42,7 +42,7 @@ async function mkDeadUrl() {
 
 // ── 伪 WebDAV 服务器：内存树 + 真 HTTP ───────────────────────────────────
 
-async function mkDavServer({ auth = null } = {}) {
+async function mkDavServer({ auth = null, strictParents = false } = {}) {
   const tree = new Map()   // decoded posix path ('/a/b') → { dir:true } | { buf:Buffer }
   const treeSet = (p, v) => tree.set(p, v)
   const log = []
@@ -68,6 +68,13 @@ async function mkDavServer({ auth = null } = {}) {
       if (req.method === 'OPTIONS') { res.writeHead(200, { DAV: '1,2' }); res.end(); return }
       if (req.method === 'MKCOL') {
         if (entry) { res.writeHead(405); res.end(); return }
+        // strictParents：复刻坚果云行为（issue #15 实测）——父集合缺失时 MKCOL
+        // 返回 409 Conflict（RFC 4918），而不是宽松地自动补齐父目录
+        if (strictParents) {
+          const parts = p.split('/').filter(Boolean)
+          const parent = parts.length > 1 ? '/' + parts.slice(0, -1).join('/') : '/'
+          if (parts.length > 1 && !tree.has(parent)) { res.writeHead(409); res.end(); return }
+        }
         ensureParents(p)
         tree.set(p, { dir: true })
         res.writeHead(201); res.end(); return
@@ -181,6 +188,54 @@ test('webdav client: auth enforced, probe/mkdirs/put/get/list/delete roundtrip',
     assert.equal(await c.deletePath('backup/inst-1/skills/SKILL.md'), true)
     assert.equal(await c.deletePath('backup/inst-1/skills/SKILL.md'), true, '404 tolerated as deleted')
     assert.equal(await c.getFile('backup/inst-1/skills/SKILL.md'), null)
+  } finally { await srv.close() }
+})
+
+// ── issue #15：webdavDir（basePath）不存在时首次备份 ─────────────────────
+// 坚果云行为：父集合缺失时 MKCOL 返回 409（RFC 4918），basePath 自身从未被
+// 创建 → mkdirs('backup/<实例ID>') 的首段 MKCOL <root>/backup 直接 409。
+
+test('webdav probe notes a missing base dir instead of a bare success', async () => {
+  const srv = await mkDavServer({ strictParents: true })
+  try {
+    const c = W.createWebdavClient({ url: srv.url, basePath: 'dsh-sync' })
+    const probe = await c.probe()
+    assert.equal(probe.ok, true, 'still reachable+authenticated')
+    assert.equal(probe.baseMissing, true, 'probe notes the missing base dir')
+    const plain = W.createWebdavClient({ url: srv.url, basePath: '' })
+    srv.treeSet('/', { dir: true })
+    const rootProbe = await plain.probe()
+    assert.deepEqual(rootProbe, { ok: true }, 'no note when basePath is empty and the root exists')
+  } finally { await srv.close() }
+})
+
+test('webdav first backup with a nonexistent basePath: ensureBase creates it before backup/ (坚果云 409)', async () => {
+  const srv = await mkDavServer({ strictParents: true })
+  try {
+    const c = W.createWebdavClient({ url: srv.url, basePath: 'dsh-sync' })
+    // 修复前：MKCOL /dsh-sync/backup 的父集合缺失 → 409 直接抛出
+    await c.mkdirs('backup/inst-9')
+    const mkcols = srv.log.filter((e) => e.method === 'MKCOL').map((e) => e.path)
+    assert.deepEqual(
+      mkcols,
+      ['/dsh-sync', '/dsh-sync/backup', '/dsh-sync/backup/inst-9'],
+      'basePath itself is MKCOLed first, then the rel path segments',
+    )
+    // ensureBase 缓存：第二次 mkdirs 不再重放 basePath 的 MKCOL
+    const before = mkcols.length
+    await c.mkdirs('backup/inst-9/skills')
+    const mkcols2 = srv.log.filter((e) => e.method === 'MKCOL').map((e) => e.path)
+    assert.ok(!mkcols2.slice(before).includes('/dsh-sync'), 'base MKCOL is cached')
+    // 完整增量备份 roundtrip（首次同步即成功，无需手动建目录）
+    const tmp = await mkdtemp()
+    const stage = join(tmp, 'stage')
+    await write(join(stage, 'a.txt'), 'aaa')
+    const r = await c.syncTreeFromDir(stage, 'backup/inst-9', { manifest: {} })
+    assert.equal(r.uploaded.length, 1)
+    assert.equal((await c.getFile('backup/inst-9/a.txt')).toString(), 'aaa')
+    // basePath 为空时循环零次：既有行为不变（宽松/严格服务器都通）
+    const bare = W.createWebdavClient({ url: srv.url, basePath: '' })
+    await bare.mkdirs('backup/other')
   } finally { await srv.close() }
 })
 

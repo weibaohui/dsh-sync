@@ -166,6 +166,7 @@ window.__ModuleLoader__.load({
       testConn: '测试连接',
       testing: '测试中…',
       testOk: '连接成功',
+      testBaseMissing: '远端子目录尚不存在，将在首次备份时自动创建',
       testFailed: '连接失败',
       lastBackupLabel: '上次备份',
       backupNone: '尚未备份',
@@ -314,6 +315,7 @@ window.__ModuleLoader__.load({
       testConn: 'Test connection',
       testing: 'Testing…',
       testOk: 'Connection OK',
+      testBaseMissing: 'Remote dir does not exist yet; it will be created on the first backup',
       testFailed: 'Connection failed',
       lastBackupLabel: 'Last backup',
       backupNone: 'never',
@@ -1047,7 +1049,9 @@ window.__ModuleLoader__.load({
         const testRow = (kind) => h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
           h(ButtonLite, { small: true, disabled: testBusy !== null, onClick: () => doTest(kind) }, testBusy === kind ? t('testing') : t('testConn')),
           testOut[kind] && h(Tag, { tone: testOut[kind].ok ? undefined : 'danger' },
-            testOut[kind].ok ? t('testOk') : t('testFailed') + (testOut[kind].error ? ' · ' + testOut[kind].error : '')))
+            testOut[kind].ok
+              ? t('testOk') + (testOut[kind].baseMissing ? ' · ' + t('testBaseMissing') : '')
+              : t('testFailed') + (testOut[kind].error ? ' · ' + testOut[kind].error : '')))
         // 上次备份结果行（webdav=增量计数 / local=镜像计数 / 失败=错误摘要）
         const backupLine = (kind) => {
           const b = status && status.lastBackup

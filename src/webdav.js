@@ -74,27 +74,50 @@ function createWebdavClient({ url, username = '', password = '', basePath = '', 
   const ok2xx = (r) => r.status >= 200 && r.status < 300
   const drain = (r) => r.arrayBuffer().catch(() => {})
 
-  async function request(method, rel, { headers = {}, body, depth } = {}) {
+  async function request(method, rel, { headers = {}, body, depth, abs } = {}) {
     const hdrs = { ...headers }
     if (auth) hdrs.authorization = auth
     if (depth !== undefined) hdrs.depth = String(depth)
     if (body !== undefined && !hdrs['content-type']) hdrs['content-type'] = 'application/octet-stream'
-    return doFetch(joinUrl(root, rel), { method, headers: hdrs, body, signal: AbortSignal.timeout(timeoutMs) })
+    return doFetch(abs !== undefined ? abs : joinUrl(root, rel), { method, headers: hdrs, body, signal: AbortSignal.timeout(timeoutMs) })
+  }
+
+  /** MKCOL the configured basePath itself, segment by segment, under the DAV
+   *  root (NOT under <root>, which already contains it). mkdirs() only creates
+   *  rel paths *below* <root>, so a basePath that doesn't exist yet makes the
+   *  first MKCOL <root>/backup return 409 (RFC 4918: parent collection missing;
+   *  坚果云实测). 405 (already exists) / 301 tolerated; cached after first
+   *  success. basePath 为空时循环零次，零请求。 */
+  let baseReady = false
+  async function ensureBase() {
+    if (baseReady) return true
+    const davRoot = String(url || '').replace(/\/+$/, '')
+    const done = []
+    for (const part of String(basePath || '').split('/').filter(Boolean)) {
+      done.push(part)
+      const r = await request('MKCOL', '', { abs: joinUrl(davRoot, done.join('/')) })
+      await drain(r)
+      if (!ok2xx(r) && r.status !== 405 && r.status !== 301) throw new Error(`MKCOL ${done.join('/')}: HTTP ${r.status}`)
+    }
+    baseReady = true
+    return true
   }
 
   /** PROPFIND Depth:0 on the DAV root — the connection test. 404 counts as
-   *  reachable+authenticated: the base dir usually only materializes on the
-   *  first backup (MKCOL), and a missing path must not read as "server down". */
+   *  reachable+authenticated with a baseMissing note: the base dir usually
+   *  only materializes on the first backup (ensureBase), and a missing path
+   *  must not read as "server down". */
   async function probe() {
     const r = await request('PROPFIND', '', { depth: 0, headers: { 'content-type': 'application/xml' }, body: PROPFIND_BODY })
     await drain(r)
-    if (r.status === 404) return { ok: true }
+    if (r.status === 404) return { ok: true, baseMissing: true }
     if (!ok2xx(r)) return { ok: false, error: `PROPFIND HTTP ${r.status}` }
     return { ok: true }
   }
 
   /** MKCOL each ancestor in turn; 405 (already exists) / 301 tolerated. */
   async function mkdirs(rel) {
+    await ensureBase()
     const parts = String(rel || '').split('/').filter(Boolean)
     let cum = ''
     for (const part of parts) {
