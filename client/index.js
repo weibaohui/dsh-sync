@@ -143,7 +143,7 @@ const ZH = {
   gitEnabledLabel: '启用 Git 同步（分支 → PR → 合并）',
   webdavEnabledLabel: '启用 WebDAV 备份',
   localEnabledLabel: '启用本地文件夹备份',
-  protocolOffHint: '开关默认关闭；开启后填写目标参数，每次同步把启用的类别镜像到 backup/<实例ID>/，本地永不被读回覆盖。',
+  protocolOffHint: '每次同步会把启用的类别镜像到 backup/<实例ID>/，本地永不被读回覆盖。',
   webdavUrlLabel: 'WebDAV 地址',
   webdavUrlPlaceholder: 'https://dav.example.com/dav/',
   webdavUserLabel: '用户名（可选）',
@@ -163,7 +163,9 @@ const ZH = {
   backupUploaded: '上传 {up} · 删除 {del} · 未变 {same}',
   backupCount: '已镜像 {n} 个文件',
   backupError: '失败',
-  noProtocolEnabled: '未启用任何同步/备份协议：请在下方任一协议页签开启并配置',
+  noProtocolEnabled: '未启用任何同步/备份协议：到上方「Git 同步 / WebDAV 备份 / 本地备份」页签勾选「启用」开关，填好参数后保存',
+  startHereTitle: '开始同步：先启用一种协议',
+  startHereHint: '任选一种方式，切到对应页签，勾选页签顶部的「启用」开关，填好参数并保存。',
   clearWebdavPassword: '清除密码',
   conflictTitle: '解决同步冲突',
   conflictHint: '检测到未合并的同步 PR（两台机器改了同一文件）。点击下方按钮，AI 会读取本机令牌、分析两边改动、解决冲突并合并 PR。',
@@ -292,7 +294,7 @@ const EN = {
   gitEnabledLabel: 'Enable Git sync (branch → PR → merge)',
   webdavEnabledLabel: 'Enable WebDAV backup',
   localEnabledLabel: 'Enable local folder backup',
-  protocolOffHint: 'Off by default; turn on and fill in the target — each sync mirrors enabled groups to backup/<instanceId>/, never reading back over live.',
+  protocolOffHint: 'Each sync mirrors the enabled groups to backup/<instanceId>/; live data is never read back over.',
   webdavUrlLabel: 'WebDAV URL',
   webdavUrlPlaceholder: 'https://dav.example.com/dav/',
   webdavUserLabel: 'Username (optional)',
@@ -312,7 +314,9 @@ const EN = {
   backupUploaded: 'uploaded {up} · deleted {del} · unchanged {same}',
   backupCount: 'mirrored {n} files',
   backupError: 'failed',
-  noProtocolEnabled: 'No sync/backup protocol enabled — pick one in the tabs below',
+  noProtocolEnabled: 'No sync/backup protocol enabled — open the Git / WebDAV / Local tab above, tick Enable, then save',
+  startHereTitle: 'Start here: enable a protocol first',
+  startHereHint: 'Pick a method below, open its tab, tick Enable at the top, fill in the target and save.',
   clearWebdavPassword: 'Clear password',
   conflictTitle: 'Resolve sync conflict',
   conflictHint: 'An unmerged sync PR exists (two machines edited the same file). Click below: the AI reads the local token, analyzes both sides, resolves the conflict and merges the PR.',
@@ -401,10 +405,12 @@ const STYLE = `<style>
 .sk-page{position:relative;display:flex;flex-direction:column;gap:14px;color:var(--dsw-alias-label-primary);font-family:var(--dsw-font-family);font-size:var(--dsw-font-sm-14,14px)}
 .sk-body{display:flex;flex-direction:column;gap:14px}
 .sk-toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-.sk-tabs{display:flex;gap:2px;border-bottom:1px solid var(--dsw-alias-border-l1);flex-wrap:wrap}
-.sk-tab{padding:8px 14px;border:none;background:transparent;color:var(--dsw-alias-label-secondary);font-size:13px;font-family:var(--dsw-font-family);cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap}
-.sk-tab:hover{color:var(--dsw-alias-label-primary)}
-.sk-tab.on{color:var(--dsw-alias-state-business-primary);border-bottom-color:var(--dsw-alias-state-business-primary);font-weight:600}
+    .sk-tabs{display:flex;gap:2px;border-bottom:1px solid var(--dsw-alias-border-l1);flex-wrap:wrap}
+    .sk-tab{padding:8px 14px;border:none;background:transparent;color:var(--dsw-alias-label-secondary);font-size:13px;font-family:var(--dsw-font-family);cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap}
+    .sk-tab:hover{color:var(--dsw-alias-label-primary)}
+    .sk-tab.on{color:var(--dsw-alias-state-business-primary);border-bottom-color:var(--dsw-alias-state-business-primary);font-weight:600}
+    .sk-startHere{border-color:var(--dsw-alias-state-business-primary)}
+    .sk-startHere .sk-toolbar{margin-top:2px}
 .sk-spacer{flex:1}
 .sk-hint{color:var(--dsw-alias-label-secondary)}
 .sk-dir{color:var(--dsw-alias-label-tertiary);font-size:var(--dsw-font-xs-13,12px)}
@@ -1068,6 +1074,24 @@ function SettingsSection({ t }) {
             h('div', { className: 'sk-spin' }), statusError ? t('statusError') : '…')))
     }
 
+    // 协议启用状态（issue #16）：generalEl/引导卡/底部工具栏共用；必须在
+    // status===null 早退之后计算（读取 status.protocols）。
+    const pr = status.protocols || {}
+    const anyActive = !!((pr.git && pr.git.enabled !== false && status.repoUrl && status.hasToken)
+      || (pr.webdav && pr.webdav.enabled && pr.webdav.configured)
+      || (pr.local && pr.local.enabled && pr.local.configured))
+    // 未启用任何协议时的引导卡（issue #16）：提示写在底部工具栏，而协议页签
+    // 在页面顶部——内容一长（滚动后）提示里的「下方」与实际布局相反，用户
+    // 照着找永远找不到开启开关。改为在页签行下直接给三协议跳转按钮。
+    const startHereEl = h('div', { className: 'sk-card sk-startHere' },
+      h('div', { className: 'sk-head' },
+        h('span', { className: 'sk-dir' }, t('startHereTitle'))),
+      h('div', { className: 'sk-hint' }, t('startHereHint')),
+      h('div', { className: 'sk-toolbar' },
+        h(ButtonLite, { onClick: () => setTab('git') }, `${t('tabsGit')} →`),
+        h(ButtonLite, { onClick: () => setTab('webdav') }, `${t('tabsWebdav')} →`),
+        h(ButtonLite, { onClick: () => setTab('local') }, `${t('tabsLocal')} →`)))
+
     // ── 通用 tab：实例状态 / 内容开关 / 快照 / 调度 ──
     const generalEl = [
       h('div', { className: 'sk-card' },
@@ -1172,7 +1196,7 @@ function SettingsSection({ t }) {
     // ── WebDAV tab：开关 + 地址/账号 + 测试 + 上次备份 ──
     const webdavEl = [
       protocolToggle(wdvOn, setWdvOn, t('webdavEnabledLabel')),
-      wdvOn && h('div', { className: 'sk-hint' }, t('protocolOffHint')),
+      h('div', { className: 'sk-hint' }, t('protocolOffHint')),
       wdvOn && h('div', { className: 'sk-card' },
         fieldRow(t('webdavUrlLabel'),
           h('input', { className: 'sk-input', value: wdv.url, onChange: e => setWdv(p => ({ ...p, url: e.target.value })), placeholder: t('webdavUrlPlaceholder'), style: { width: '100%' } })),
@@ -1194,7 +1218,7 @@ function SettingsSection({ t }) {
     // ── 本地文件夹 tab：开关 + 目录 + 测试 + 上次备份 ──
     const localEl = [
       protocolToggle(locOn, setLocOn, t('localEnabledLabel')),
-      locOn && h('div', { className: 'sk-hint' }, t('protocolOffHint')),
+      h('div', { className: 'sk-hint' }, t('protocolOffHint')),
       locOn && h('div', { className: 'sk-card' },
         fieldRow(t('localDirLabel'),
           h('input', { className: 'sk-input', value: locDir, onChange: e => setLocDir(e.target.value), placeholder: t('localDirPlaceholder'), style: { width: '100%' } }),
@@ -1204,10 +1228,6 @@ function SettingsSection({ t }) {
     ]
 
     // 底部工具栏（所有页签可见）：保存 + 立即同步；未启用任何协议时给提示
-    const pr = status.protocols || {}
-    const anyActive = !!((pr.git && pr.git.enabled !== false && status.repoUrl && status.hasToken)
-      || (pr.webdav && pr.webdav.enabled && pr.webdav.configured)
-      || (pr.local && pr.local.enabled && pr.local.configured))
     const toolbar = h('div', { className: 'sk-toolbar' },
       h(ButtonLite, { onClick: doSave }, t('save')),
       h(ButtonLite, { primary: true, disabled: busy || status.syncing || !anyActive, title: !anyActive ? t('noProtocolEnabled') : undefined, onClick: doSync }, busy ? t('syncing') : t('syncNow')),
@@ -1221,6 +1241,9 @@ function SettingsSection({ t }) {
       : h('div', { className: 'sk-body' },
           h('div', { className: 'sk-tabs' },
             TABS.map(([key, label]) => h('button', { key, className: 'sk-tab' + (tab === key ? ' on' : ''), onClick: () => setTab(key) }, t(label)))),
+          // 引导卡（issue #16）：提示写「下方」而页签在顶部，滚动后方向指引与
+          // 实际布局相反。未启用任何协议时直接在页签行下给三协议跳转按钮。
+          !anyActive && startHereEl,
           tab === 'general' && wrap(generalEl),
           tab === 'git' && wrap(gitEl),
           tab === 'webdav' && wrap(webdavEl),

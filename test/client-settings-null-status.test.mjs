@@ -94,3 +94,23 @@ test('status 到达后面板渲染 instanceId 与页签（issue #14 回归）', 
   assert.ok(acc.text.includes('inst-abc-123'), 'status 到达后应渲染 instanceId')
   assert.ok(acc.classes.has('sk-tabs'), 'status 到达后应渲染页签')
 })
+
+test('未启用任何协议时渲染引导卡（三协议跳转按钮），启用后消失（issue #16 回归）', () => {
+  hookState.length = 0; hookIdx = 0; firstSetter = null
+  const { render, setStatus } = bootClient()
+  render() // 首帧，hooks 就位
+  setStatus()({ instanceId: 'inst-1', syncing: false, protocols: {} })
+  let acc = collect(render())
+  // collect 把整个 className 字符串作为一项（'sk-card sk-startHere'）
+  assert.ok([...acc.classes].some((c) => c.includes('sk-startHere')), '未启用协议时应渲染引导卡')
+  assert.ok(acc.text.includes('Start here'), '引导卡标题应出现')
+  // 三个跳转按钮（Git / WebDAV / Local）都渲染
+  for (const label of ['Git', 'WebDAV', 'Local']) {
+    assert.ok(acc.text.includes(label), `引导卡应含 ${label} 跳转按钮`)
+  }
+  // 任一协议启用并配置后，引导卡消失
+  setStatus()({ instanceId: 'inst-1', syncing: false, protocols: { webdav: { enabled: true, configured: true, url: 'https://dav.example.com' } } })
+  acc = collect(render())
+  assert.ok(![...acc.classes].some((c) => c.includes('sk-startHere')), '任一协议启用并配置后引导卡消失')
+  assert.ok(!acc.text.includes('Start here'), '引导卡文案随之消失')
+})
