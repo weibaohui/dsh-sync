@@ -144,10 +144,27 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
   > 如果是公开仓库，上传后有密钥泄露危险：同步的 settings 组会整文件上传本机 `~/.dsh/settings.yaml`（可能含其它插件的明文密钥）。请确认该仓库是私有仓库、并接受此风险后再继续。
 
   确认后本次保存才放行（`allowUnverifiedRepo` 标记不落盘，每次保存都要重新确认）。**请务必确认仓库为私有。**
-- **非 GitCode 的功能差异**：PR 创建/合并、「AI 冲突处理」(`conflict/run`)、「清理遗留分支」(`prune-branches`) 目前仍是 GitCode 专属；其他托管方走「只推分支」的降级路径（`prSkipped`），这些入口会返回明确错误而不是静默失败。
+- **非 GitCode 的功能差异**：GitHub 已支持 PR 创建 + squash 合并 + 合并后删除远端分支（见 0.4.12）；GitLab / Gitee / 自建主机仍走「只推分支」的降级路径（`prSkipped`）。「AI 冲突处理」(`conflict/run`)、「清理遗留分支」(`prune-branches`) 仍为 GitCode 专属，对这些托管方会返回明确错误而不是静默失败。
 - **登录用户名按托管方**：GitHub 需要 `x-access-token`，其余用 `oauth2`（经 `DSH_SYNC_USER` 传给 askpass 助手；token 依旧只走环境变量、不进 argv）。
 
 ## 更新日志（0.4.3 → 0.4.10）
+
+### 0.4.12 —— GitHub 托管方支持 分支 → PR → squash 合并 → 删除分支
+
+**背景**：0.4.5 起支持 GitHub/GitLab/Gitee 托管方，但 PR 创建/合并仍是 GitCode 专属，其他托管方走 `prSkipped` 只推分支。对 GitHub 用户的实际后果：`main` 永不前进、每次同步遗留一个 `sync/*` 分支（真机实测两天可积上百个）、多机 `pull` 拿不到新数据。
+
+**改动**（GitCode 逻辑未动）：
+
+1. 新增 GitHub PR 适配层 `githubRequest` / `githubCreatePullRequest` / `githubGetPullRequest` / `githubMergePullRequest`：`Authorization: Bearer` + `api.github.com`，端点与 GitCode 结构一致（`POST /repos/:o/:r/pulls`、`GET /pulls/:n`、`PUT /pulls/:n/merge`）；
+2. 新增 `prChannelFor(repoUrl)` 统一选择 PR 通道：GitHub → 新适配层，GitCode → 原实现，自建/未知主机 → 返回 `null`（继续只推分支）；
+3. `runPush` / `promoteSnapshotToCloud` 接入该通道；GitHub 对同 head 的重复 PR 返回 422 时按「已有进行中的同步 PR」处理，与 GitCode 的 409 语义对齐；
+4. GitHub 的 `mergeable` 由后台异步计算（首查常为 `null`），新增 `githubWaitMergeable`（默认 6 × 800ms）轮询到确定值，避免把可合并 PR 误判成冲突；
+5. 合并成功后复用通用的 `git push <remote> --delete <branch>` 删除远端 sync 分支；
+6. 测试：`test/providers.test.mjs` 新增 GitHub 创建/查询/合并、mergeable 轮询、通道选择三组用例（mock fetch，离线可跑）。
+
+**验证**：全量 89 项离线测试通过；另用真实私有仓库跑通「推送分支 → 创建 PR → mergeable 轮询 → squash 合并 → 删除分支 → main 前进」全链路。
+
+**未覆盖**：GitLab / Gitee 的 PR 接口形态不同（GitLab 为 `merge_requests` + 项目 id，Gitee 为 `pulls` + `access_token`），本次未实现，仍保持只推分支；GitHub 上的「AI 解决冲突」仍不可用，冲突 PR 会保持打开等人工处理。
 
 0.4.3–0.4.5 围绕同一条问题链：**「点保存 → 提示成功 → 重启 dsh 后设置回到默认」**。0.4.3 修根因，0.4.4 补面板状态层与保存语义，0.4.5 扩展托管方并明确泄露风险闸门；0.4.6 收尾同一批 Windows 环境下暴露的问题（覆盖镜像不生效 + 测试夹具的环境假设）；0.4.7 修另一条独立的线：「浏览远端」报 400（浏览 ref 的非快进更新被 git 拒绝）；0.4.8 修桌面版 AI 对齐不可用（apiproxy 基地址写死 3080）与「远端 main 被改写后同步基线失效、会话日志永久挂账」。
 

@@ -89,3 +89,63 @@ test('checkRepoAccess: 自建/未知主机判不了私有性 → 必须用户确
   assert.equal(yes.verified, false)
   assert.equal(yes.unverified, true)
 })
+
+// ── fork 增强：GitHub 的 分支→PR→合并 适配层 ──
+
+test('github PR API: 创建/查询/合并（Authorization: Bearer + 标准 REST 端点）', async () => {
+  const orig = globalThis.fetch
+  const calls = []
+  const mk = (obj, status = 200) => ({ ok: status < 400, status, text: async () => JSON.stringify(obj) })
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), method: init && init.method, body: init && init.body, headers: (init && init.headers) || {} })
+    const u = String(url)
+    if (u.endsWith('/repos/o/priv/pulls') && init.method === 'POST') return mk({ number: 12 }, 201)
+    if (u.endsWith('/repos/o/priv/pulls/12')) return mk({ number: 12, mergeable: true })
+    if (u.endsWith('/repos/o/priv/pulls/12/merge')) return mk({ merged: true }, 200)
+    return mk({ message: 'not found' }, 404)
+  }
+  try {
+    const created = await I.githubCreatePullRequest('tok', 'o', 'priv', { head: 'b', base: 'main', title: 't', body: 'x' })
+    assert.equal(created.ok, true)
+    assert.equal(created.json.number, 12)
+    assert.equal(calls[0].url, 'https://api.github.com/repos/o/priv/pulls')
+    assert.equal(calls[0].headers.Authorization, 'Bearer tok')
+    assert.deepEqual(JSON.parse(calls[0].body), { head: 'b', base: 'main', title: 't', body: 'x' })
+
+    const got = await I.githubGetPullRequest('tok', 'o', 'priv', 12)
+    assert.equal(got.json.mergeable, true)
+
+    const merged = await I.githubMergePullRequest('tok', 'o', 'priv', 12, 'squash')
+    assert.equal(merged.ok, true)
+    assert.equal(calls[calls.length - 1].method, 'PUT')
+    assert.deepEqual(JSON.parse(calls[calls.length - 1].body), { merge_method: 'squash' })
+  } finally { globalThis.fetch = orig }
+})
+
+test('githubWaitMergeable: mergeable 异步计算，轮询到确定值（null → true/false）', async () => {
+  const orig = globalThis.fetch
+  const mk = (obj) => ({ ok: true, status: 200, text: async () => JSON.stringify(obj) })
+  let n = 0
+  globalThis.fetch = async () => { n++; return n < 3 ? mk({ mergeable: null }) : mk({ mergeable: true }) }
+  try {
+    const r = await I.githubWaitMergeable('tok', 'o', 'r', 1, { tries: 5, delayMs: 1 })
+    assert.equal(r.mergeable, true)
+    assert.equal(r.conflict, false)
+    assert.ok(n >= 3, '必须轮询到非 null 才返回')
+  } finally { globalThis.fetch = orig }
+
+  globalThis.fetch = async () => mk({ mergeable: false })
+  try {
+    const r2 = await I.githubWaitMergeable('tok', 'o', 'r', 2, { tries: 3, delayMs: 1 })
+    assert.equal(r2.mergeable, false)
+    assert.equal(r2.conflict, true)
+  } finally { globalThis.fetch = orig }
+})
+
+test('prChannelFor: GitHub 走 PR 通道，GitCode 保持原通道，其他主机降级为 null', () => {
+  assert.deepEqual(I.prChannelFor('https://github.com/o/r.git'), { kind: 'github', owner: 'o', repo: 'r' })
+  assert.deepEqual(I.prChannelFor('git@github.com:o/r.git'), { kind: 'github', owner: 'o', repo: 'r' })
+  assert.deepEqual(I.prChannelFor('https://gitcode.com/o/r.git'), { kind: 'gitcode', owner: 'o', repo: 'r' })
+  assert.equal(I.prChannelFor('https://git.internal.corp/team/repo.git'), null, '自建主机仍只推分支')
+  assert.equal(I.prChannelFor(''), null)
+})
