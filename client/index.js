@@ -101,7 +101,7 @@ const ZH = {
   gitMissing: '未检测到 git',
   repoMissing: '尚未初始化，点「立即同步」',
   notConfigured: '未配置仓库地址或访问令牌',
-  tokenLabel: 'GitCode 访问令牌',
+  tokenLabel: '访问令牌',
   tokenConfigured: '已配置',
   tokenHint: '需有目标私有仓库的读写权限',
   clearToken: '清除',
@@ -111,7 +111,7 @@ const ZH = {
   conflictModeLabel: '冲突处理',
   conflictModeAi: 'AI 处理（推荐）',
   conflictModeManual: '人工网页合并',
-  conflictModeHint: '两台机器改了同一文件时：AI 模式由 AI 自动语义合并（冲突处理/智能对齐/远端对齐全部入口）；人工模式关闭所有 AI 处理，PR 挂起等你去 gitcode.com 合并',
+  conflictModeHint: '两台机器改了同一文件时：AI 模式由 AI 自动语义合并（冲突处理/智能对齐/远端对齐全部入口）；人工模式关闭所有 AI 处理，PR 挂起等你去托管站点合并',
   toggleSkills: '技能 skills',
   toggleSessions: '会话 sessions',
   toggleSettings: '设置 settings',
@@ -183,7 +183,6 @@ const ZH = {
   runDone: '解决完成',
   runFailed: '执行失败',
   outputLabel: '输出',
-  repoUrlPlaceholder: 'https://gitcode.com/<owner>/<repo>.git',
   operationFailed: '操作失败',
   browseRemote: '浏览远端',
   browseTitle: '浏览远端备份',
@@ -252,7 +251,7 @@ const EN = {
   gitMissing: 'git not found',
   repoMissing: 'Not initialized — hit Sync now',
   notConfigured: 'Repo URL or access token not configured',
-  tokenLabel: 'GitCode access token',
+  tokenLabel: 'Access token',
   tokenConfigured: 'configured',
   tokenHint: 'Needs read/write on the target private repo',
   clearToken: 'Clear',
@@ -262,7 +261,7 @@ const EN = {
   conflictModeLabel: 'Conflict handling',
   conflictModeAi: 'AI resolve (recommended)',
   conflictModeManual: 'Manual web merge',
-  conflictModeHint: 'When two machines edit the same file: AI mode lets the AI merge semantically (all AI entries: conflict, align, remote align); manual mode disables every AI entry and leaves the PR open for you to merge on gitcode.com',
+  conflictModeHint: 'When two machines edit the same file: AI mode lets the AI merge semantically (all AI entries: conflict, align, remote align); manual mode disables every AI entry and leaves the PR open for you to merge on the hosting site',
   toggleSkills: 'Skills',
   toggleSessions: 'Sessions',
   toggleSettings: 'Settings',
@@ -334,7 +333,6 @@ const EN = {
   runDone: 'Resolved',
   runFailed: 'Run failed',
   outputLabel: 'Output',
-  repoUrlPlaceholder: 'https://gitcode.com/<owner>/<repo>.git',
   operationFailed: 'Operation failed',
   browseRemote: 'Browse remote',
   browseTitle: 'Browse remote backups',
@@ -782,6 +780,12 @@ const REPO_PROVIDERS = [
   { id: 'other', host: '' },
 ]
 
+/** 地址占位符跟随所选托管方，避免选了 Gitee 却提示填 gitcode.com 地址（issue#18）。 */
+function repoUrlPlaceholderFor(id) {
+  const p = REPO_PROVIDERS.find(x => x.id === id)
+  return p && p.host ? p.host + '<owner>/<repo>.git' : 'https://<host>/<owner>/<repo>.git'
+}
+
 function SettingsSection({ t }) {
   const [status, setStatus] = useState(null)
   const [busy, setBusy] = useState(false)
@@ -1160,7 +1164,7 @@ function SettingsSection({ t }) {
         providerChoice === 'other' && h('div', { className: 'sk-hint' }, t('providerOtherRisk')),
         status.provider && status.provider.unverified ? h('div', { className: 'sk-tag danger' }, t('providerUnverified', { host: status.provider.host || '?' })) : null,
         h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
-          h('input', { className: 'sk-input', value: repoUrl, onChange: e => setRepoUrl(e.target.value), placeholder: t('repoUrlPlaceholder'), style: { flex: 1 } }),
+          h('input', { className: 'sk-input', value: repoUrl, onChange: e => setRepoUrl(e.target.value), placeholder: repoUrlPlaceholderFor(providerChoice), style: { flex: 1 } }),
           status.repoUrl && h(ButtonLite, { onClick: doClearRepoUrl }, t('clearRepoUrl'))),
         h('input', { className: 'sk-input', value: branch, onChange: e => setBranch(e.target.value), placeholder: t('branchLabel'), style: { width: '100%' } }),
         h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },

@@ -46,10 +46,19 @@ const posixSh = findPosixSh()
 // ── Pure helpers ────────────────────────────────────────────────────────
 
 test('parseRepoUrl handles gitcode urls', () => {
-  assert.deepEqual(I.parseRepoUrl('https://gitcode.com/weibh/my-sync.git'), { owner: 'weibh', repo: 'my-sync' })
-  assert.deepEqual(I.parseRepoUrl('https://gitcode.com/weibh/my-sync'), { owner: 'weibh', repo: 'my-sync' })
+  // 0.4.12（issue#18）：返回形状升级为 { provider, owner, repo }，且 gitee 也解析
+  assert.deepEqual(I.parseRepoUrl('https://gitcode.com/weibh/my-sync.git'), { provider: 'gitcode', owner: 'weibh', repo: 'my-sync' })
+  assert.deepEqual(I.parseRepoUrl('https://gitcode.com/weibh/my-sync'), { provider: 'gitcode', owner: 'weibh', repo: 'my-sync' })
+  assert.deepEqual(I.parseRepoUrl('https://gitee.com/lan/my-sync.git'), { provider: 'gitee', owner: 'lan', repo: 'my-sync' })
+  assert.deepEqual(I.parseRepoUrl('git@gitee.com:lan/my-sync.git'), { provider: 'gitee', owner: 'lan', repo: 'my-sync' })
+  // 路径子串回退：本地影子仓库把裸仓建在 …/gitcode.com/o/r.git 路径下时照常识别
+  assert.deepEqual(I.parseRepoUrl('/tmp/x/gitcode.com/o/r.git'), { provider: 'gitcode', owner: 'o', repo: 'r' })
+  // 没有 PR 实现的平台（GitHub/GitLab/自建/乱串）一律 null → 走 prSkipped，与旧行为一致
   assert.equal(I.parseRepoUrl('https://github.com/x/y'), null)
+  assert.equal(I.parseRepoUrl('https://gitlab.com/g/s/r.git'), null)
+  assert.equal(I.parseRepoUrl('/tmp/plain-origin.git'), null)
   assert.equal(I.parseRepoUrl('not a url'), null)
+  assert.equal(I.parseRepoUrl(''), null)
 })
 
 test('git auth travels via GIT_ASKPASS env, never argv (issue #9)', { skip: posixSh ? false : 'POSIX sh 不可用（未安装 Git for Windows 的 usr/bin/sh.exe）' }, async () => {

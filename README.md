@@ -144,7 +144,7 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
   > 如果是公开仓库，上传后有密钥泄露危险：同步的 settings 组会整文件上传本机 `~/.dsh/settings.yaml`（可能含其它插件的明文密钥）。请确认该仓库是私有仓库、并接受此风险后再继续。
 
   确认后本次保存才放行（`allowUnverifiedRepo` 标记不落盘，每次保存都要重新确认）。**请务必确认仓库为私有。**
-- **非 GitCode 的功能差异**：PR 创建/合并、「AI 冲突处理」(`conflict/run`)、「清理遗留分支」(`prune-branches`) 目前仍是 GitCode 专属；其他托管方走「只推分支」的降级路径（`prSkipped`），这些入口会返回明确错误而不是静默失败。
+- **非 GitCode 的功能差异**：PR 创建/合并、「AI 冲突处理」(`conflict/run`)、「清理遗留分支」(`prune-branches`) 在 GitCode 与 Gitee 上全量可用（0.4.12 起，issue #18；Gitee 走 `access_token` query 认证）；GitHub / GitLab / 自建走「只推分支」的降级路径（`prSkipped`），这些入口会返回明确错误而不是静默失败。PR 创建/合并失败不再抛错中断，返回结构化结果（`prFailed`/`mergeRejected` + `branch`/`prNumber` + 响应体里的业务原因），避免孤儿分支堆积。
 - **登录用户名按托管方**：GitHub 需要 `x-access-token`，其余用 `oauth2`（经 `DSH_SYNC_USER` 传给 askpass 助手；token 依旧只走环境变量、不进 argv）。
 
 ## 更新日志（0.4.3 → 0.4.10）
@@ -306,6 +306,7 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 
 | 插件版本 | 适配 dsh 版本 | 备注 |
 |---------|--------------|------|
+| 0.4.12 | 0.1.7-rc.2 | 修复 issue #18：Gitee 远端 PR 从不创建（`parseRepoUrl` 只认 gitcode.com → 永远走 `prSkipped`，孤儿分支堆积）。provider 抽象层：`PROVIDER_API_BASE`/`providerSupportsPr`/`providerRequest`（Gitee 走 `access_token` query——`PRIVATE-TOKEN` 头实测 401；GitCode 逐字保留），`parseRepoUrl` 多平台化（返回 `{provider, owner, repo}`；保留路径子串回退，GitHub/GitLab/自建仍 null 与旧行为一致）；PR 创建/合并、`conflict/run`（AI 冲突处理）、`prune-branches` 对 Gitee 全量可用；PR 创建/合并失败不再 `throw`（孤儿分支堆积根因），返回结构化结果（`prFailed`/`mergeRejected` + `branch`/`prNumber`）并带上响应体里的业务原因（Gitee 405「此 Pull Request 未通过设置的审查」）；`finalizeConflictBranch` 无 PR 面时不再谎报 `merged:true`；`createPullRequest` 支持 `prune_source_branch` 透传；前端 tokenLabel/提示文案去 GitCode 硬编码、地址占位符跟随托管方；离线测试 94 项（新增 gitee 适配 7 项） |
 | 0.4.10 | 0.2.1-rc.2 | 修复 issue #15：webdavDir（basePath）不存在时首次备份 409——坚果云在父集合缺失时 MKCOL 返回 409 Conflict（RFC 4918），basePath 自身从未被创建；新增 `ensureBase()` 在 `mkdirs()` 入口先相对 DAV 根逐段创建 basePath（405/301 容忍、成功后缓存，basePath 为空零请求），`request()` 增加 `abs` 覆盖；probe 404 附带 `baseMissing` 标记，客户端测试连接行提示「远端子目录尚不存在，将在首次备份时自动创建」；伪服务器 `strictParents` 模式复刻坚果云行为，离线测试 86 项 |
 | 0.4.9 | 0.1.7-rc.2 | 修复 issue #14（两题均由用户 SDWSXXR 报告并附 patch）：(1) 设置页首帧整块崩溃——`status === null` 早退渲染加载态；(2) 子路径反代部署全 404——客户端 API 基址改由 `document.baseURI` 推导；离线测试 84 项 |
 | 0.4.8 | 0.1.7-rc.2 | 修复两条与 Windows/桌面版相关的独立问题：(1) **桌面版 AI 智能对齐/解决冲突只报 `fetch failed`**——apiproxy 基地址写死 `http://127.0.0.1:3080`，而桌面宿主 Web 服务用随机端口（实测 43120），改为 `apply()` 用 `ctx.webServer.port` 覆盖（`DSH_WEB_URL`/3080 保留兜底），网络错误信息带上尝试过的基地址；(2) **远端 main 被改写后同步基线失效 → 会话日志永久挂账**——`lastSyncedCommit` 不再是远端 tip 的祖先时 `git diff 基线 FETCH_HEAD` 会把本机正在写的文件误判 bothModified（推送时按 preserve 回退成远端版本，且只能靠 AI 对齐销账），新增 `resolveSyncBase()` 退化到 `git merge-base`、`revalidatePendingBoth()` 自动销账失效挂账、`runPush` 未合并路径 `restoreBaseline()` 恢复 HEAD；离线测试 82 项（新增 3 例基线守护/apiproxy 回归） |

@@ -170,6 +170,22 @@ function pickFileSettingsLayer(fileSettings, fileMtime, hostWriteAt) {
 }
 
 const GITCODE_API_BASE = 'https://api.gitcode.com/api/v5'
+// Gitee OpenAPI v5 与 GitCode 的三个 PR 端点同构（POST /repos/{o}/{r}/pulls、
+// GET /repos/{o}/{r}/pulls/{n}、PUT /repos/{o}/{r}/pulls/{n}/merge，merge_method
+// 均为 merge|squash|rebase），差别只有两处（issue#18 真机实测）：
+//   1) base URL 是 gitee.com/api/v5（不是 api.gitee.com）
+//   2) 凭证是 query 参数 access_token——Gitee 文档没有 securityDefinitions，
+//      PRIVATE-TOKEN 头实测 HTTP 401，不属于其公开行为，不能照搬 GitCode 的写法
+const PROVIDER_API_BASE = {
+  gitcode: GITCODE_API_BASE,
+  gitee: 'https://gitee.com/api/v5',
+}
+/** 该 provider 是否支持 PR 创建/合并（决定 runPush 走 PR 还是 prSkipped）。
+ *  不在表里的平台（GitHub/GitLab/自建）与改动前行为一致：parseRepoUrl 返回
+ *  null，推送分支但不建 PR——不破坏自建 git 场景。 */
+function providerSupportsPr(provider) { return !!(provider && PROVIDER_API_BASE[provider]) }
+/** 供文案动态列出「支持 PR 流程」的托管方（如「GitCode/Gitee」）。 */
+function prProviderLabels() { return Object.keys(PROVIDER_API_BASE).map(k => PROVIDER_LABEL[k] || k).join('/') }
 const MAX_BODY_BYTES = 64 * 1024
 const SYNC_TIMEOUT_MS = 10 * 60 * 1000
 const CONFLICT_RUN_TIMEOUT_MS = 30 * 60 * 1000
@@ -513,11 +529,39 @@ async function acquireLock(lockFile) {
 
 // ── GitCode REST: repo privacy check + PR create / detail / merge ──
 
-/** Parse `https://gitcode.com/<owner>/<repo>(.git)` → { owner, repo }. */
+/** Parse a remote URL into { provider, owner, repo } (issue#18). Returns null
+ *  when the host has no PR REST implementation (GitHub/GitLab/自建/无法解析) —
+ *  callers then take the push-only prSkipped path, exactly as before.
+ *  识别顺序：完整 URL（含 scp 形式 git@host:path 兜底）→ 路径子串扫描。子串
+ *  扫描保留旧正则的宽松行为：测试影子仓库常把裸仓建在 …/gitcode.com/o/r.git
+ *  这类路径下（git 仍推本地路径，PR 走 mock REST），不能因为改成 URL 解析就丢。 */
 function parseRepoUrl(url) {
-  const m = String(url || '').match(/gitcode\.com\/([^/]+)\/([^/?.]+?)(?:\.git)?(?:[/?#]|$)/i)
-  if (!m) return null
-  return { owner: m[1], repo: m[2] }
+  const raw = String(url || '').trim()
+  if (!raw) return null
+  const providerOfHost = (host) => {
+    host = String(host || '').toLowerCase()
+    if (/(^|\.)gitcode\.(com|net)$/.test(host)) return 'gitcode'
+    if (/(^|\.)gitee\.com$/.test(host)) return 'gitee'
+    return 'generic'
+  }
+  let host = '', pathname = ''
+  try {
+    const u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : raw.replace(/^git@([^:]+):/, 'https://$1/'))
+    host = u.hostname.toLowerCase()
+    pathname = u.pathname
+  } catch {
+    // 不是可解析的 URL：按「路径里嵌着 known host」扫（旧版宽松正则的等价物）
+    const m = raw.match(/(?:^|\/)(gitcode\.(?:com|net)|gitee\.com)\/([^/]+)\/([^/?.]+?)(?:\.git)?(?:[/?#]|$)/i)
+    if (!m) return null
+    const provider = providerOfHost(m[1])
+    if (!providerSupportsPr(provider)) return null
+    return { provider, owner: m[2], repo: m[3] }
+  }
+  const segs = pathname.replace(/^\/+/, '').replace(/\.git$/i, '').split('/').filter(Boolean)
+  if (segs.length < 2) return null
+  const provider = providerOfHost(host)
+  if (!providerSupportsPr(provider)) return null
+  return { provider, owner: segs.slice(0, -1).join('/'), repo: segs[segs.length - 1] }
 }
 
 const PROVIDER_LABEL = { gitcode: 'GitCode', github: 'GitHub', gitlab: 'GitLab', gitee: 'Gitee', generic: '自建/未知主机' }
@@ -635,6 +679,32 @@ async function gitcodeRequest(token, method, path, body, { apiBase = GITCODE_API
   return { ok: r.ok, status: r.status, json, text }
 }
 
+/** Provider-aware REST dispatch (issue#18)：按 provider 选 base URL 与凭证位置。
+ *  GitCode 原样转发 gitcodeRequest（PRIVATE-TOKEN 实测结论不动，零回归）；
+ *  Gitee 走 access_token query 参数（PRIVATE-TOKEN 头实测 401）。其余 provider
+ *  没有实现，直接抛错（调用方都先用 parseRepoUrl/providerSupportsPr 闸过）。 */
+async function providerRequest(provider, token, method, path, body) {
+  const apiBase = PROVIDER_API_BASE[provider]
+  if (!apiBase) throw new Error(`不支持 PR 合并的远端类型：${provider || 'unknown'}`)
+  if (provider !== 'gitee') return gitcodeRequest(token, method, path, body, { apiBase })
+  // path 可能已带 query（如 /pulls?state=merged&per_page=100&page=1），要用 & 续接
+  const sep = path.includes('?') ? '&' : '?'
+  const url = apiBase + path + sep + 'access_token=' + encodeURIComponent(token)
+  const init = { method, headers: { 'Content-Type': 'application/json' } }
+  if (body !== undefined) init.body = JSON.stringify(body)
+  const r = await fetch(url, init)
+  const text = await r.text()
+  let json = null
+  try { json = text === '' ? null : JSON.parse(text) } catch {}
+  return { ok: r.ok, status: r.status, json, text }
+}
+
+/** PR 响应里的业务错误信息（「未通过设置的审查」这类拒绝只写在 body 里，
+ *  只报 HTTP 状态码排查成本极高——issue#18 附带发现 A）。 */
+function prErrorMessage(r) {
+  return (r.json && (r.json.message || r.json.error)) || (r.text || '').slice(0, 160) || '（无错误信息）'
+}
+
 /** Verify the configured repo exists AND is private. Public repos are refused
  *  because sync carries credentials (settings.yaml is mirrored wholesale). */
 async function checkRepoPrivate(token, repoUrl) {
@@ -647,16 +717,21 @@ async function checkRepoPrivate(token, repoUrl) {
   return { ok: true, owner: parsed.owner, repo: parsed.repo, defaultBranch: r.json && (r.json.default_branch || 'main') }
 }
 
-async function createPullRequest(token, owner, repo, { head, base, title, body }) {
-  return gitcodeRequest(token, 'POST', `/repos/${owner}/${repo}/pulls`, { head, base, title: title || 'dsh-sync', body: body || '' })
+async function createPullRequest(provider, token, owner, repo, { head, base, title, body, pruneSourceBranch = false }) {
+  const payload = { head, base, title: title || 'dsh-sync', body: body || '' }
+  // prune_source_branch：服务端在合并时自动删源分支（Gitee 支持，issue#18 实测）。
+  // 现有调用点仍保留「合并成功后再补一发 push --delete」的 best-effort 兜底，
+  // 两边共存无害（分支已删时 push --delete 静默失败）。
+  if (pruneSourceBranch) payload.prune_source_branch = true
+  return providerRequest(provider, token, 'POST', `/repos/${owner}/${repo}/pulls`, payload)
 }
 
-async function getPullRequest(token, owner, repo, number) {
-  return gitcodeRequest(token, 'GET', `/repos/${owner}/${repo}/pulls/${number}`)
+async function getPullRequest(provider, token, owner, repo, number) {
+  return providerRequest(provider, token, 'GET', `/repos/${owner}/${repo}/pulls/${number}`)
 }
 
-async function mergePullRequest(token, owner, repo, number, method) {
-  return gitcodeRequest(token, 'PUT', `/repos/${owner}/${repo}/pulls/${number}/merge`, method ? { merge_method: method } : {})
+async function mergePullRequest(provider, token, owner, repo, number, method) {
+  return providerRequest(provider, token, 'PUT', `/repos/${owner}/${repo}/pulls/${number}/merge`, method ? { merge_method: method } : {})
 }
 
 // ── Sync spec: which live roots mirror into which shadow paths ──
@@ -905,9 +980,8 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
   try {
     const parsed = parseRepoUrl(eff.repoUrl)
     if (!parsed) {
-      // non-GitCode remote (local test, self-hosted git): push the branch only;
-      // PR create/merge is GitCode-specific and skipped. Advance shadow onto
-      // main as the next cycle's pull baseline.
+      // 无 PR REST 面的远端（GitHub/GitLab/本地测试/自建 git）：只推分支；
+      // PR 创建/合并跳过。推进影子基线到 main，作为下一轮 pull 的基线。
       await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv).catch(() => {})
       await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
       await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
@@ -918,11 +992,18 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
     }
     // 同仓库 PR 的 head 就是分支名（`user:branch` 是 fork PR 语法，GitCode 会 400）
     const prBody = { head: branch, base: eff.branch, title: `dsh-sync ${instanceId}`, body: `Auto sync from ${instanceId}` }
-    const prRes = await createPullRequest(eff.token, parsed.owner, parsed.repo, prBody)
+    const prRes = await createPullRequest(parsed.provider, eff.token, parsed.owner, parsed.repo, prBody)
     if (!prRes.ok) {
       // 409 = branch already has an open PR (idempotent retry); try to find it
       if (prRes.status === 409) return { pushed: true, prConflict: true, message: '已有进行中的同步 PR' }
-      throw new Error(`创建 PR 失败（HTTP ${prRes.status}）：${(prRes.json && prRes.json.message) || prRes.text.slice(0, 160)}`)
+      // 不能 throw（issue#18 附带发现 B）：此时分支**已经推上去了**，throw 会让
+      // state 丢掉分支名（lastPushedBranch 不落盘），远端留下一个没人认领的
+      // sync/* 分支，下一轮再建新分支重演堆积。正常返回并带上分支名与原因。
+      state.lastPushedBranch = branch
+      return {
+        pushed: true, prCreated: false, prFailed: true, branch, settingsPreserved,
+        reason: `分支已推送但创建 PR 失败（HTTP ${prRes.status}）：${prErrorMessage(prRes)}`,
+      }
     }
     const prNumber = prRes.json && (prRes.json.number || prRes.json.id)
     state.lastPushedBranch = branch
@@ -931,14 +1012,23 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
     // 7. mergeable?
     let mergeable = false, conflict = false
     try {
-      const det = await getPullRequest(eff.token, parsed.owner, parsed.repo, prNumber)
+      const det = await getPullRequest(parsed.provider, eff.token, parsed.owner, parsed.repo, prNumber)
       mergeable = det.ok && det.json && det.json.mergeable === true
       conflict = det.ok && det.json && det.json.mergeable === false
     } catch {}
 
     if (mergeable) {
-      const mr = await mergePullRequest(eff.token, parsed.owner, parsed.repo, prNumber, 'squash')
-      if (!mr.ok) throw new Error(`合并 PR 失败（HTTP ${mr.status}）`)
+      const mr = await mergePullRequest(parsed.provider, eff.token, parsed.owner, parsed.repo, prNumber, 'squash')
+      if (!mr.ok) {
+        // 不能 throw：finally 的 restoreBaseline 会恢复基线，但 push 结果整个丢失
+        // ——PR 已创建（lastPrNumber 已落盘）却没人认领，下一轮又建一个新 PR，
+        // 重演「970+ 个 sync 分支」堆积。典型触发：仓库要求审查人员（Gitee 用
+        // HTTP 405 表达「此 Pull Request 未通过设置的审查」这个业务拒绝）。
+        return {
+          pushed: true, prConflict: true, prNumber, mergeRejected: true, settingsPreserved,
+          reason: `PR #${prNumber} 已创建但合并被拒（HTTP ${mr.status}）：${prErrorMessage(mr)}`,
+        }
+      }
       // 合并即删远端 sync 分支（best effort）：不删的话每次同步遗留一个分支，
       // 真机仓库实测两天积了 970+ 个 sync/* 分支
       await gitExec(binary, ['push', remote, '--delete', branch], repoDir, authEnv).catch(() => {})
@@ -1328,22 +1418,29 @@ async function promoteSnapshotToCloud(binary, eff, { repoDir, instanceId, state,
   await gitExec(binary, ['push', remote, `HEAD:${branch}`], repoDir, authEnv)
   const parsed = parseRepoUrl(eff.repoUrl)
   if (!parsed) {
-    // 非 GitCode 远端：推分支后把影子基线推进到 main（与 runPush 的 prSkipped 路径一致）
+    // 无 PR REST 面的远端：推分支后把影子基线推进到 main（与 runPush 的 prSkipped 路径一致）
     await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv).catch(() => {})
     await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
     await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
     state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
     return { promoted: true, prSkipped: true, branch }
   }
-  const prRes = await createPullRequest(eff.token, parsed.owner, parsed.repo, { head: branch, base: eff.branch, title: `dsh-sync snapshot ${instanceId} ${snapName}`, body: 'snapshot → cloud archive' })
-  if (!prRes.ok) throw new Error(`创建快照 PR 失败（HTTP ${prRes.status}）：${(prRes.json && prRes.json.message) || prRes.text.slice(0, 160)}`)
+  const prRes = await createPullRequest(parsed.provider, eff.token, parsed.owner, parsed.repo, { head: branch, base: eff.branch, title: `dsh-sync snapshot ${instanceId} ${snapName}`, body: 'snapshot → cloud archive' })
+  if (!prRes.ok) {
+    // 分支已推上去，不 throw（issue#18 同 runPush）：返回结构化结果保住分支名
+    return {
+      promoted: true, prFailed: true, branch,
+      reason: `快照分支已推送但创建 PR 失败（HTTP ${prRes.status}）：${prErrorMessage(prRes)}`,
+    }
+  }
   const prNumber = prRes.json && (prRes.json.number || prRes.json.id)
-  let merged = false
+  let merged = false, mergeReason = null
   try {
-    const det = await getPullRequest(eff.token, parsed.owner, parsed.repo, prNumber)
+    const det = await getPullRequest(parsed.provider, eff.token, parsed.owner, parsed.repo, prNumber)
     if (det.ok && det.json && det.json.mergeable === true) {
-      const mr = await mergePullRequest(eff.token, parsed.owner, parsed.repo, prNumber, 'squash')
+      const mr = await mergePullRequest(parsed.provider, eff.token, parsed.owner, parsed.repo, prNumber, 'squash')
       merged = !!mr.ok
+      if (!mr.ok) mergeReason = `PR #${prNumber} 已创建但合并被拒（HTTP ${mr.status}）：${prErrorMessage(mr)}`
     }
   } catch {}
   if (merged) await gitExec(binary, ['push', remote, '--delete', branch], repoDir, authEnv).catch(() => {})
@@ -1351,7 +1448,7 @@ async function promoteSnapshotToCloud(binary, eff, { repoDir, instanceId, state,
   await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
   await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
   state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
-  return { promoted: true, merged, prNumber, branch }
+  return mergeReason ? { promoted: true, merged, prNumber, branch, reason: mergeReason } : { promoted: true, merged, prNumber, branch }
 }
 
 // ── Multi-protocol backup: webdav / local are pure backup targets ──────
@@ -1791,8 +1888,11 @@ async function prepareConflictTree(binary, eff, { repoDir, branch }) {
 
 /** Push the resolved branch, wait for the PR to report mergeable, squash-merge
  *  it, delete the remote sync branch and advance the shadow baseline onto the
- *  canonical branch. Non-GitCode remotes (local test bare repos): push only —
- *  the PR REST surface doesn't exist there. */
+ *  canonical branch. Remotes without a PR REST surface (local test bare repos,
+ *  GitHub/GitLab/自建): push only and return merged:false + prSkipped:true with
+ *  a reason — the caller must NOT treat the branch as merged (issue#18: the
+ *  old `merged:true, prSkipped:true` here lied to the UI while remote main
+ *  never moved). */
 async function finalizeConflictBranch(binary, eff, { repoDir, branch, prNumber, state, logger, pollTries = 5, pollGapMs = 3000 }) {
   const log = (m) => { if (logger && logger.warn) logger.warn(m) }
   const remote = eff.repoUrl, authEnv = gitAuthEnv(eff)
@@ -1804,23 +1904,31 @@ async function finalizeConflictBranch(binary, eff, { repoDir, branch, prNumber, 
   if (cur !== branch) return { merged: false, reason: `影子仓库当前在 ${cur || 'detached HEAD'}，不在分支 ${branch}（可能被并发同步重置）——请重新发起冲突处理` }
   await gitExec(binary, ['push', remote, `HEAD:${branch}`], repoDir, authEnv)
   const parsed = parseRepoUrl(eff.repoUrl)
-  if (!parsed) return { merged: true, prSkipped: true }
+  if (!parsed) {
+    // 自建/未知主机没有 PR REST 面：不能再报 merged:true —— 分支已推上去但
+    // 远端 main 纹丝不动，谎报会让 UI 显示「已合并」（issue#18）
+    return { merged: false, prSkipped: true, branch, reason: '该远端不支持 PR 合并：冲突修复分支已推送，但需要手动合并到 ' + eff.branch }
+  }
   // mergeable 是异步计算的：推送前 PR 一直挂着 mergeable=false，GitCode 在 push 后
   // 才重算——所以每拍先等再查，false 不一票否决，连续到最后仍 false 才判失败
   let mergeable = false, lastState
   for (let i = 0; i < pollTries; i++) {
     await new Promise(r => setTimeout(r, pollGapMs))
     try {
-      const det = await getPullRequest(eff.token, parsed.owner, parsed.repo, prNumber)
+      const det = await getPullRequest(parsed.provider, eff.token, parsed.owner, parsed.repo, prNumber)
       if (det.ok && det.json) {
         lastState = det.json.mergeable
         if (det.json.mergeable === true) { mergeable = true; break }
       }
     } catch (e) { log(`dsh-sync: PR 轮询失败：${e && e.message}`) }
   }
-  if (!mergeable) return { merged: false, reason: lastState === false ? 'PR 仍报 mergeable=false（冲突可能未全部解决）' : 'PR mergeable 状态超时未就绪' }
-  const mr = await mergePullRequest(eff.token, parsed.owner, parsed.repo, prNumber, 'squash')
-  if (!mr.ok) return { merged: false, reason: `合并 PR 失败（HTTP ${mr.status}）` }
+  if (!mergeable) return { merged: false, prNumber, branch, reason: lastState === false ? 'PR 仍报 mergeable=false（冲突可能未全部解决）' : 'PR mergeable 状态超时未就绪' }
+  const mr = await mergePullRequest(parsed.provider, eff.token, parsed.owner, parsed.repo, prNumber, 'squash')
+  if (!mr.ok) {
+    // 业务拒绝写在响应体里（Gitee 405「此 Pull Request 未通过设置的审查」），
+    // 必须带出来，否则 HTTP 状态码会把排查方向带偏（issue#18 附带发现 A）
+    return { merged: false, prNumber, branch, reason: `合并 PR 失败（HTTP ${mr.status}）：${prErrorMessage(mr)}` }
+  }
   // 合并即删远端 sync 分支 + 影子基线推进到 main（与 runPush 合并路径一致）
   await gitExec(binary, ['push', remote, '--delete', branch], repoDir, authEnv).catch(() => {})
   await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv).catch(() => {})
@@ -2093,7 +2201,7 @@ module.exports = {
   name: 'dsh-sync',
   inject: ['webServer', 'settings', 'connection'],
   Config: Config ?? undefined,
-  __internals: { syncSpec, defaultRoots, parseRepoUrl, detectRepoProvider, gitUsernameForProvider, checkRepoAccess, providerRepoInfo, gitAuthEnv, askpassPath, writeAskpass, ASKPASS_SH, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, prepareConflictTree, finalizeConflictBranch, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud, msysPathConvEnv, expandTilde,
+  __internals: { syncSpec, defaultRoots, parseRepoUrl, detectRepoProvider, providerSupportsPr, prProviderLabels, PROVIDER_API_BASE, providerRequest, prErrorMessage, createPullRequest, getPullRequest, mergePullRequest, gitUsernameForProvider, checkRepoAccess, providerRepoInfo, gitAuthEnv, askpassPath, writeAskpass, ASKPASS_SH, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, prepareConflictTree, finalizeConflictBranch, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud, msysPathConvEnv, expandTilde,
     // remote backup browser（导出供测试）
     BROWSE_REF, logicalSpec, parseRemotePath, categoryForLogical, pullSafety, parseLsTree, fetchBrowseRef, browseRemote, browseRemoteTree, expandToBlobs, planRemotePull, applyRemotePullPlan,
     // apiproxy（导出供测试：mock fetch 驱动 wire 形态回归）
@@ -2779,8 +2887,8 @@ module.exports = {
             if (eff.conflictMode !== 'ai') { sendJson(res, 403, { error: 'conflictMode 为 manual，AI 冲突处理已关闭（设置页改为「ai」后可用）' }); return }
             if (!eff.repoUrl || !eff.token) { sendJson(res, 400, { error: '未配置仓库或令牌' }); return }
             const conflictProvider = detectRepoProvider(eff.repoUrl)
-            if (conflictProvider.kind !== 'gitcode') {
-              sendJson(res, 400, { error: 'AI 冲突处理依赖 PR 流程，目前仅在 GitCode 仓库上可用（当前主机 ' + (conflictProvider.host || '未知') + '）：换用 GitCode 私有仓库，或手动解决分支冲突' })
+            if (!providerSupportsPr(conflictProvider.kind)) {
+              sendJson(res, 400, { error: 'AI 冲突处理依赖 PR 流程，目前仅在 ' + prProviderLabels() + ' 仓库上可用（当前主机 ' + (conflictProvider.host || '未知') + '）：换用受支持的私有仓库，或手动解决分支冲突' })
               return
             }
             const body = await readJsonBody(req)
@@ -2805,7 +2913,9 @@ module.exports = {
                 }
                 try {
                   const r = await finalizeConflictBranch(eff2.gitBinary, eff2, { repoDir, branch: branch2, prNumber: prNumber2, state, logger: ctx.logger })
-                  if (r.merged) job.output += r.prSkipped ? '\n已推送分支（本地远端，无 PR 可合并）\n' : `\nPR #${prNumber2} 已合并，分支已清理\n`
+                  // 不支持 PR 的远端如今 merged:false + reason（不再谎报 merged:true），
+                  // 走下方失败分支提示手动合并；这里只剩真正的合并成功
+                  if (r.merged) job.output += `\nPR #${prNumber2} 已合并，分支已清理\n`
                   else { job.status = 'error'; job.code = 1; job.output += '\n[finalize 失败] ' + r.reason + '\n' }
                 } catch (e) {
                   job.status = 'error'; job.code = 1
@@ -2893,12 +3003,12 @@ module.exports = {
             const eff = syncSettings()
             if (!eff.repoUrl || !eff.token) { sendJson(res, 400, { error: '未配置仓库或令牌' }); return }
             const pruneProvider = detectRepoProvider(eff.repoUrl)
-            if (pruneProvider.kind !== 'gitcode') {
-              sendJson(res, 400, { error: '清理遗留分支走的是 GitCode PR 列表接口，目前仅支持 GitCode 仓库（当前主机 ' + (pruneProvider.host || '未知') + '）——请到仓库网页端手动删除 sync/* 分支' })
+            if (!providerSupportsPr(pruneProvider.kind)) {
+              sendJson(res, 400, { error: '清理遗留分支走的是已合并 PR 列表接口，目前仅 ' + prProviderLabels() + ' 支持（当前主机 ' + (pruneProvider.host || '未知') + '）——请到仓库网页端手动删除 sync/* 分支' })
               return
             }
             const parsed = parseRepoUrl(eff.repoUrl)
-            if (!parsed) { sendJson(res, 400, { error: '仅支持 GitCode 仓库' }); return }
+            if (!parsed) { sendJson(res, 400, { error: '仅支持 ' + prProviderLabels() + ' 仓库' }); return }
             const hasShadow = await fsP.access(join(repoDir, '.git')).then(() => true).catch(() => false)
             if (!hasShadow) { sendJson(res, 400, { error: '影子仓库未初始化，先同步一次' }); return }
             const remote = eff.repoUrl, authEnv = gitAuthEnv(eff)
@@ -2908,7 +3018,7 @@ module.exports = {
             // 收集已合并 PR 的 head 分支（翻页直到取完，上限 20 页 × 100）
             const mergedHeads = new Set()
             for (let page = 1; page <= 20; page++) {
-              const r = await gitcodeRequest(eff.token, 'GET', `/repos/${parsed.owner}/${parsed.repo}/pulls?state=merged&per_page=100&page=${page}`)
+              const r = await providerRequest(pruneProvider.kind, eff.token, 'GET', `/repos/${parsed.owner}/${parsed.repo}/pulls?state=merged&per_page=100&page=${page}`)
               if (!r.ok || !Array.isArray(r.json) || r.json.length === 0) break
               for (const pr of r.json) { if (pr.head && pr.head.ref) mergedHeads.add(pr.head.ref) }
               if (r.json.length < 100) break
